@@ -1,0 +1,24 @@
+# Credentials
+.env
+certificate.p12
+
+# Data (large SQLite databases — produced by the collector)
+data/
+
+# Sample source files (large DATEX II JSON payloads)
+sources/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Probe / scratch scripts
+_probe*.py
+
+# Misc
+output.png
+.claude/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
