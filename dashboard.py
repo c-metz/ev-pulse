@@ -329,8 +329,11 @@ if power_traces:
             snap_times.add(t)
 
     for snap_t in sorted(snap_times):
+        # Convert to ISO string -- Plotly's annotation code cannot do
+        # arithmetic on pandas Timestamps directly.
+        x_val = pd.Timestamp(snap_t).isoformat()
         fig.add_vline(
-            x=snap_t,
+            x=x_val,
             line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dash"),
             annotation=dict(
                 text="SNAPSHOT",
