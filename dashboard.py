@@ -119,7 +119,7 @@ def load_static(slug: str) -> pd.DataFrame:
 def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load pre-computed MW timeline and SNAPSHOT timestamps."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
-    empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame()
+    empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
     if not db.exists():
         return empty
 
@@ -135,14 +135,27 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         if "estimated_power_mw" not in cols:
             return empty
 
+        # Power timeline (DELTA + SNAPSHOT rows that have a value)
         power_df = pd.read_sql_query(
             """
             SELECT collected_at_utc AS time,
-                   estimated_power_mw AS power_mw,
-                   delivery_type
+                   estimated_power_mw AS power_mw
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
               AND estimated_power_mw IS NOT NULL
+            ORDER BY snapshot_id
+            """,
+            conn,
+            params=(cutoff,),
+        )
+
+        # SNAPSHOT timestamps (independent of estimated_power_mw)
+        snap_df = pd.read_sql_query(
+            """
+            SELECT collected_at_utc AS time
+            FROM snapshot_runs
+            WHERE collected_at_utc >= ?
+              AND delivery_type = 'SNAPSHOT'
             ORDER BY snapshot_id
             """,
             conn,
@@ -153,10 +166,10 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         return empty
 
     power_df["time"] = pd.to_datetime(power_df["time"])
-    snapshots = power_df[power_df["delivery_type"] == "SNAPSHOT"][["time", "power_mw"]].copy()
-    timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
+    snap_df["time"] = pd.to_datetime(snap_df["time"])
+    timeline = power_df.set_index("time").sort_index()
 
-    return timeline, snapshots
+    return timeline, snap_df
 
 
 # ═══════════════════════════════════════════════════════════════════════
