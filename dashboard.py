@@ -329,18 +329,19 @@ if power_traces:
             snap_times.add(t)
 
     for snap_t in sorted(snap_times):
-        # Convert to ISO string -- Plotly's annotation code cannot do
-        # arithmetic on pandas Timestamps directly.
-        x_val = pd.Timestamp(snap_t).isoformat()
-        fig.add_vline(
-            x=x_val,
+        x_val = pd.Timestamp(snap_t).to_pydatetime()
+        # Use add_shape + add_annotation separately — Plotly's add_vline
+        # with annotation triggers a _mean() call that fails on dates.
+        fig.add_shape(
+            type="line", x0=x_val, x1=x_val,
+            y0=0, y1=1, yref="paper",
             line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dash"),
-            annotation=dict(
-                text="SNAPSHOT",
-                font=dict(size=9, color="rgba(255,255,255,0.45)"),
-                yref="paper", y=1.0,
-                showarrow=False,
-            ),
+        )
+        fig.add_annotation(
+            x=x_val, y=1.0, yref="paper",
+            text="SNAPSHOT",
+            font=dict(size=9, color="rgba(255,255,255,0.45)"),
+            showarrow=False, yanchor="bottom",
         )
 
     fig.update_layout(
