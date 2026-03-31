@@ -57,6 +57,8 @@ class Provider(ABC):
     slug: str
     tracked_columns: list[str]
     in_use_status: str
+    power_column: str        # static DB column with rated power per point
+    power_to_mw: float       # multiplier to convert power_column to MW
 
     # ── Derived helpers ───────────────────────────────────────────────
     @property

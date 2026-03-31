@@ -113,7 +113,8 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
             point_count          INTEGER NOT NULL,
             {in_use_col}         INTEGER NOT NULL,
             available_count      INTEGER NOT NULL,
-            unknown_count        INTEGER NOT NULL
+            unknown_count        INTEGER NOT NULL,
+            estimated_power_mw   REAL
         );
 
         CREATE TABLE IF NOT EXISTS point_status_history (
@@ -132,6 +133,12 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_psh_snapshot
             ON point_status_history(snapshot_id);
     """)
+
+    # Migration: add estimated_power_mw to existing databases
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
+    if "estimated_power_mw" not in cols:
+        conn.execute("ALTER TABLE snapshot_runs ADD COLUMN estimated_power_mw REAL")
+
     conn.commit()
     return conn
 
@@ -203,46 +210,13 @@ def store_dynamic_snapshot(
     pub_time: str | None,
     delivery_type: str,
     previous_state: pd.DataFrame | None,
+    static_conn: sqlite3.Connection | None = None,
 ) -> tuple[int, pd.DataFrame]:
     collected_at = datetime.now(timezone.utc).isoformat()
     tracked = provider.tracked_columns
 
-    in_use = int(status_df["status"].eq(provider.in_use_status).sum())
-    available = int(status_df["status"].eq("available").sum())
-    unknown = int(status_df["status"].eq("unknown").sum())
-
-    in_use_col = provider.in_use_count_column
-    cursor = conn.execute(
-        f"""
-        INSERT INTO snapshot_runs
-            (collected_at_utc, publication_time_utc, delivery_type,
-             point_count, {in_use_col}, available_count, unknown_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (collected_at, pub_time or "", delivery_type,
-         len(status_df), in_use, available, unknown),
-    )
-    snapshot_id = cursor.lastrowid
-
+    # ── Step 1: Compute the full updated state ───────────────────────
     changed_df = find_changed_rows(status_df, previous_state, tracked)
-
-    if not changed_df.empty:
-        insert_df = changed_df[KEY_COLUMNS + tracked].copy()
-        insert_df.insert(0, "snapshot_id", snapshot_id)
-        insert_df.insert(1, "collected_at_utc", collected_at)
-        insert_df.insert(2, "publication_time_utc", pub_time or "")
-        insert_df = insert_df.where(pd.notna(insert_df), None)
-        insert_df.to_sql(
-            "point_status_history", conn, if_exists="append", index=False,
-        )
-
-    conn.commit()
-
-    LOGGER.info(
-        "Snapshot #%d (%s): %d points, %d changed, %d in-use, %d available",
-        snapshot_id, delivery_type, len(status_df), len(changed_df),
-        in_use, available,
-    )
 
     if previous_state is not None and not previous_state.empty:
         updated = previous_state.copy()
@@ -256,9 +230,70 @@ def store_dynamic_snapshot(
                     [updated, row[KEY_COLUMNS + tracked].to_frame().T],
                     ignore_index=True,
                 )
-        return snapshot_id, updated
     else:
-        return snapshot_id, status_df[KEY_COLUMNS + tracked].copy()
+        updated = status_df[KEY_COLUMNS + tracked].copy()
+
+    # ── Step 2: Counts from the FULL state (not just the delivery) ───
+    in_use = int(updated["status"].eq(provider.in_use_status).sum())
+    available = int(updated["status"].eq("available").sum())
+    unknown = int(updated["status"].eq("unknown").sum())
+
+    # ── Step 2b: Estimated power (MW) from static rated power ────────
+    estimated_power_mw = None
+    if static_conn is not None:
+        try:
+            in_use_ids = updated.loc[
+                updated["status"] == provider.in_use_status, "point_id"
+            ].tolist()
+            if in_use_ids:
+                placeholders = ",".join("?" * len(in_use_ids))
+                pcol = provider.power_column
+                row = static_conn.execute(
+                    f"SELECT SUM({pcol}) FROM charging_points "
+                    f"WHERE point_id IN ({placeholders})",
+                    in_use_ids,
+                ).fetchone()
+                estimated_power_mw = (row[0] or 0.0) * provider.power_to_mw
+            else:
+                estimated_power_mw = 0.0
+        except Exception:
+            LOGGER.debug("Could not compute estimated power", exc_info=True)
+
+    # ── Step 3: Insert snapshot_run with full-state counts ───────────
+    in_use_col = provider.in_use_count_column
+    cursor = conn.execute(
+        f"""
+        INSERT INTO snapshot_runs
+            (collected_at_utc, publication_time_utc, delivery_type,
+             point_count, {in_use_col}, available_count, unknown_count,
+             estimated_power_mw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (collected_at, pub_time or "", delivery_type,
+         len(updated), in_use, available, unknown, estimated_power_mw),
+    )
+    snapshot_id = cursor.lastrowid
+
+    # ── Step 4: Insert only changed rows into history ────────────────
+    if not changed_df.empty:
+        insert_df = changed_df[KEY_COLUMNS + tracked].copy()
+        insert_df.insert(0, "snapshot_id", snapshot_id)
+        insert_df.insert(1, "collected_at_utc", collected_at)
+        insert_df.insert(2, "publication_time_utc", pub_time or "")
+        insert_df = insert_df.where(pd.notna(insert_df), None)
+        insert_df.to_sql(
+            "point_status_history", conn, if_exists="append", index=False,
+        )
+
+    conn.commit()
+
+    LOGGER.info(
+        "Snapshot #%d (%s): %d total, %d changed, %d in-use, %d available",
+        snapshot_id, delivery_type, len(updated), len(changed_df),
+        in_use, available,
+    )
+
+    return snapshot_id, updated
 
 
 def compact_history(conn: sqlite3.Connection, provider: Provider) -> int:
@@ -309,6 +344,7 @@ def collect_dynamic_once(
     provider: Provider,
     dynamic_conn: sqlite3.Connection,
     previous_state: pd.DataFrame | None,
+    static_conn: sqlite3.Connection | None = None,
 ) -> pd.DataFrame | None:
     cursor = get_cursor(dynamic_conn)
 
@@ -335,12 +371,14 @@ def collect_dynamic_once(
             _, current_state = store_dynamic_snapshot(
                 dynamic_conn, provider, status_df, pub_time,
                 delivery["type"], previous_state=None,
+                static_conn=static_conn,
             )
         else:
             # Delta: contains only changed points → merge into state
             _, current_state = store_dynamic_snapshot(
                 dynamic_conn, provider, status_df, pub_time,
                 delivery["type"], previous_state=current_state,
+                static_conn=static_conn,
             )
 
     last_lm = deliveries[-1].get("last_modified")
@@ -380,6 +418,7 @@ def run_collector(
             try:
                 previous_state = collect_dynamic_once(
                     provider, dynamic_conn, previous_state,
+                    static_conn=static_conn,
                 )
             except Exception:
                 LOGGER.exception(

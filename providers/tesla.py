@@ -38,6 +38,8 @@ class TeslaProvider(Provider):
     slug = "tesla"
     tracked_columns = ["status", "opening_status", "operation_status"]
     in_use_status = "occupied"
+    power_column = "point_power_kw"
+    power_to_mw = 1e-3
 
     # ── Schema ────────────────────────────────────────────────────────
     def static_table_ddl(self) -> str:

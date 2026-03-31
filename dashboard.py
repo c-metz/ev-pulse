@@ -1,8 +1,8 @@
-"""EV Charging Monitor — Live Dashboard.
+"""EV Pulse -- Live Dashboard.
 
-Reads the collector's SQLite databases and presents real-time KPIs,
-a geographic map, and power-draw timelines for Germany's public
-EV charging infrastructure.
+Real-time EV charging infrastructure monitor for Germany.
+Reads the collector's SQLite databases and presents a geographic map
+and estimated power-draw timeline with SNAPSHOT ground-truth markers.
 
 Run:
     streamlit run dashboard.py
@@ -16,11 +16,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import pydeck as pdk
 import streamlit as st
 
 # ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="EV Charging Monitor — Germany",
+    page_title="EV Pulse -- Germany",
     page_icon="⚡",
     layout="wide",
 )
@@ -51,6 +52,7 @@ STATUS_COLORS = {
     "charging": "#e74c3c",
     "occupied": "#e74c3c",
     "outOfService": "#95a5a6",
+    "outOfOrder": "#95a5a6",
     "unknown": "#bdc3c7",
     "removed": "#7f8c8d",
     "reserved": "#f39c12",
@@ -60,12 +62,23 @@ STATUS_COLORS = {
 DEFAULT_COLOR = "#bdc3c7"
 
 
+def hex_to_rgba(hex_str: str, alpha: int = 180) -> list[int]:
+    h = hex_str.lstrip("#")
+    return [int(h[i : i + 2], 16) for i in (0, 2, 4)] + [alpha]
+
+
+def hex_to_rgba_str(hex_color: str, opacity: float = 0.3) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{opacity})"
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  DATA LOADING  (cached 60 s)
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
 def load_current_state(slug: str) -> pd.DataFrame:
-    """Most recent status per charging point (last snapshot + deltas)."""
+    """Most recent status per charging point (last SNAPSHOT + deltas)."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     if not db.exists():
         return pd.DataFrame()
@@ -86,7 +99,7 @@ def load_current_state(slug: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_static(slug: str) -> pd.DataFrame:
-    """Static metadata — coordinates, power ratings, etc."""
+    """Static metadata -- coordinates, power ratings, etc."""
     db = DATA_DIR / f"{slug}_static.sqlite"
     if not db.exists():
         return pd.DataFrame()
@@ -95,106 +108,48 @@ def load_static(slug: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def load_snapshot_runs(slug: str, hours: int = 48) -> pd.DataFrame:
-    """Aggregated snapshot runs for the timeline charts."""
+def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load pre-computed MW timeline and SNAPSHOT timestamps."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
+    empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame()
     if not db.exists():
-        return pd.DataFrame()
+        return empty
+
     cutoff = (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
         .__sub__(pd.Timedelta(hours=hours))
         .isoformat()
     )
+
     with sqlite3.connect(db) as conn:
-        cfg = PROVIDERS[slug]
-        return pd.read_sql_query(
-            f"""
-            SELECT collected_at_utc, delivery_type, point_count,
-                   {cfg['in_use_col']}, available_count, unknown_count
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
+        if "estimated_power_mw" not in cols:
+            return empty
+
+        power_df = pd.read_sql_query(
+            """
+            SELECT collected_at_utc AS time,
+                   estimated_power_mw AS power_mw,
+                   delivery_type
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
+              AND estimated_power_mw IS NOT NULL
             ORDER BY snapshot_id
             """,
             conn,
             params=(cutoff,),
         )
 
+    if power_df.empty:
+        return empty
 
-@st.cache_data(ttl=60)
-def replay_power(slug: str, hours: int = 48) -> pd.DataFrame:
-    """Replay dynamic history and compute estimated MW from rated power."""
-    cfg = PROVIDERS[slug]
-    static = load_static(slug)
-    if static.empty:
-        return pd.DataFrame(columns=["time", "power_mw"])
+    power_df["time"] = pd.to_datetime(power_df["time"])
 
-    power_col = cfg["power_col"]
-    if power_col not in static.columns:
-        return pd.DataFrame(columns=["time", "power_mw"])
+    snapshots = power_df[power_df["delivery_type"] == "SNAPSHOT"][["time", "power_mw"]].copy()
+    timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
-    power_map = dict(
-        zip(
-            static["point_id"],
-            pd.to_numeric(static[power_col], errors="coerce").fillna(0) * cfg["to_mw"],
-        )
-    )
-
-    db = DATA_DIR / f"{slug}_dynamic.sqlite"
-    if not db.exists():
-        return pd.DataFrame(columns=["time", "power_mw"])
-
-    cutoff = (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .__sub__(pd.Timedelta(hours=hours))
-        .isoformat()
-    )
-
-    with sqlite3.connect(db) as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT h.point_id, h.status, h.collected_at_utc,
-                   h.snapshot_id, s.delivery_type
-            FROM point_status_history h
-            JOIN snapshot_runs s ON h.snapshot_id = s.snapshot_id
-            WHERE h.collected_at_utc >= ?
-            ORDER BY h.id
-            """,
-            conn,
-            params=(cutoff,),
-        )
-
-    if df.empty:
-        return pd.DataFrame(columns=["time", "power_mw"])
-
-    df["collected_at_utc"] = pd.to_datetime(df["collected_at_utc"])
-    snapshot_ids = set(
-        df.loc[df["delivery_type"] == "SNAPSHOT", "snapshot_id"].unique()
-    )
-
-    in_use_status = cfg["in_use"]
-    state: dict[str, str] = {}
-    records: list[tuple] = []
-
-    for (sid, ts), group in df.groupby(
-        ["snapshot_id", "collected_at_utc"], sort=False
-    ):
-        if sid in snapshot_ids:
-            state = dict(zip(group["point_id"], group["status"]))
-        else:
-            for pid, status in zip(group["point_id"], group["status"]):
-                state[pid] = status
-
-        total_mw = sum(
-            power_map.get(pid, 0.0)
-            for pid, s in state.items()
-            if s == in_use_status
-        )
-        records.append((ts, total_mw))
-
-    result = pd.DataFrame(records, columns=["time", "power_mw"]).set_index("time")
-    return result.sort_index()
+    return timeline, snapshots
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -203,10 +158,12 @@ def replay_power(slug: str, hours: int = 48) -> pd.DataFrame:
 
 # ── Header ────────────────────────────────────────────────────────────
 st.markdown(
-    "<h1 style='margin-bottom:0'>⚡ EV Charging Monitor — Germany</h1>"
-    "<p style='color:gray;margin-top:0'>"
-    "Real-time AFIR / DATEX II data from Mobilithek&ensp;·&ensp;"
-    f"Last refresh: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    "<h1 style='margin-bottom:0'>EV Pulse &mdash; Germany</h1>"
+    "<p style='color:gray;margin-top:0;font-size:0.95em'>"
+    "Real-time EV charging infrastructure &ensp;|&ensp;"
+    "AFIR / DATEX II via "
+    "<a href='https://mobilithek.info' style='color:gray'>Mobilithek</a>"
+    f"&ensp;|&ensp;{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
     "</p>",
     unsafe_allow_html=True,
 )
@@ -222,8 +179,19 @@ with st.sidebar:
     )
     timeline_hours = st.slider("Timeline window (hours)", 6, 168, 48, step=6)
     auto_refresh = st.toggle("Auto-refresh (60 s)", value=False)
-    if auto_refresh:
-        st.markdown("_Page will reload automatically._")
+
+    st.divider()
+    st.caption(
+        "**Data quality note** -- Between SNAPSHOT deliveries "
+        "(vertical dashed lines on the timeline), values are derived "
+        "from incremental delta updates and may drift from reality. "
+        "SNAPSHOTs are ground truth."
+    )
+    st.caption(
+        "Power estimates use nameplate ratings (max rated power "
+        "x 1 if in use, x 0 otherwise). Actual grid draw depends "
+        "on vehicle SOC, cable limits, and load management."
+    )
 
 # ── Load data ─────────────────────────────────────────────────────────
 all_states: dict[str, pd.DataFrame] = {}
@@ -233,39 +201,28 @@ for slug in selected_providers:
     all_states[slug] = load_current_state(slug)
     all_statics[slug] = load_static(slug)
 
-# ── KPI metrics ───────────────────────────────────────────────────────
+# ── KPI row ───────────────────────────────────────────────────────────
 total_points = 0
 total_in_use = 0
 total_available = 0
 total_mw = 0.0
-latest_ts = None
 
 for slug in selected_providers:
     state = all_states[slug]
     static = all_statics[slug]
     cfg = PROVIDERS[slug]
-
     if state.empty:
         continue
 
-    n_in_use = int((state["status"] == cfg["in_use"]).sum())
-    n_available = int((state["status"] == "available").sum())
     total_points += len(state)
-    total_in_use += n_in_use
-    total_available += n_available
+    total_in_use += int((state["status"] == cfg["in_use"]).sum())
+    total_available += int((state["status"] == "available").sum())
 
-    # Estimated MW from rated power
     power_col = cfg["power_col"]
     if not static.empty and power_col in static.columns:
         in_use_ids = set(state.loc[state["status"] == cfg["in_use"], "point_id"])
-        pw = static.loc[
-            static["point_id"].isin(in_use_ids), power_col
-        ]
+        pw = static.loc[static["point_id"].isin(in_use_ids), power_col]
         total_mw += pd.to_numeric(pw, errors="coerce").fillna(0).sum() * cfg["to_mw"]
-
-    ts = pd.to_datetime(state["collected_at_utc"]).max()
-    if latest_ts is None or ts > latest_ts:
-        latest_ts = ts
 
 usage_pct = (total_in_use / total_points * 100) if total_points else 0
 
@@ -273,131 +230,105 @@ cols = st.columns(5)
 cols[0].metric("Charging Points", f"{total_points:,}")
 cols[1].metric("In Use", f"{total_in_use:,}")
 cols[2].metric("Available", f"{total_available:,}")
-cols[3].metric("Est. Load", f"{total_mw:,.1f} MW")
-cols[4].metric("Usage Rate", f"{usage_pct:.1f}%")
+cols[3].metric("Est. Load", f"{total_mw:,.0f} MW")
+cols[4].metric("Usage Rate", f"{usage_pct:.1f} %")
 
-# ── Map + Provider breakdown ─────────────────────────────────────────
-map_col, stats_col = st.columns([2, 1])
+st.markdown("")  # spacer
 
-with map_col:
-    st.subheader("Charging Points — Current Status")
+# ═══════════════════════════════════════════════════════════════════════
+#  MAP
+# ═══════════════════════════════════════════════════════════════════════
+st.subheader("Live Charging Point Status")
 
-    map_rows = []
-    for slug in selected_providers:
-        state = all_states[slug]
-        static = all_statics[slug]
-        cfg = PROVIDERS[slug]
-        if state.empty or static.empty:
-            continue
-        merged = state.merge(
-            static[["point_id", "latitude", "longitude"]],
-            on="point_id",
-            how="inner",
-        )
-        merged = merged.dropna(subset=["latitude", "longitude"])
-        merged["provider"] = cfg["label"]
-        merged["color"] = merged["status"].map(
-            lambda s: STATUS_COLORS.get(s, DEFAULT_COLOR)
-        )
-        map_rows.append(merged)
-
-    if map_rows:
-        map_df = pd.concat(map_rows, ignore_index=True)
-
-        # Convert hex color to RGBA list for pydeck
-        def hex_to_rgba(hex_str: str) -> list[int]:
-            h = hex_str.lstrip("#")
-            return [int(h[i : i + 2], 16) for i in (0, 2, 4)] + [180]
-
-        map_df["color_rgba"] = map_df["color"].apply(hex_to_rgba)
-
-        layer = {
-            "@@type": "ScatterplotLayer",
-            "data": map_df[
-                ["latitude", "longitude", "status", "provider", "color_rgba"]
-            ].to_dict("records"),
-            "getPosition": ["longitude", "latitude"],
-            "getFillColor": "@@=color_rgba",
-            "getRadius": 800,
-            "pickable": True,
-            "opacity": 0.7,
-            "radiusMinPixels": 2,
-            "radiusMaxPixels": 8,
-        }
-
-        st.pydeck_chart(
-            {
-                "@@type": "Deck",
-                "initialViewState": {
-                    "latitude": 51.1,
-                    "longitude": 10.4,
-                    "zoom": 5.5,
-                    "pitch": 0,
-                },
-                "layers": [layer],
-                "mapStyle": "mapbox://styles/mapbox/dark-v11",
-            },
-            use_container_width=True,
-            height=520,
-        )
-    else:
-        st.info("No geolocation data available.")
-
-with stats_col:
-    st.subheader("Provider Breakdown")
-    for slug in selected_providers:
-        state = all_states[slug]
-        cfg = PROVIDERS[slug]
-        if state.empty:
-            continue
-
-        counts = state["status"].value_counts()
-        n = len(state)
-        n_in = int(counts.get(cfg["in_use"], 0))
-
-        st.markdown(f"**{cfg['label']}** — {n:,} points")
-
-        fig = go.Figure(
-            go.Bar(
-                x=counts.values,
-                y=counts.index,
-                orientation="h",
-                marker_color=[
-                    STATUS_COLORS.get(s, DEFAULT_COLOR) for s in counts.index
-                ],
-                text=[f"{v:,}" for v in counts.values],
-                textposition="auto",
-            )
-        )
-        fig.update_layout(
-            height=180,
-            margin=dict(l=0, r=0, t=5, b=5),
-            xaxis=dict(visible=False),
-            yaxis=dict(autorange="reversed"),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# ── Power draw timeline ──────────────────────────────────────────────
-st.subheader("Estimated Power Draw (MW)")
-
-power_traces = {}
+map_rows = []
 for slug in selected_providers:
-    ts = replay_power(slug, hours=timeline_hours)
-    if not ts.empty:
-        power_traces[slug] = ts
+    state = all_states[slug]
+    static = all_statics[slug]
+    cfg = PROVIDERS[slug]
+    if state.empty or static.empty:
+        continue
+    merged = state.merge(
+        static[["point_id", "latitude", "longitude"]],
+        on="point_id",
+        how="inner",
+    )
+    merged = merged.dropna(subset=["latitude", "longitude"])
+    merged["provider"] = cfg["label"]
+    merged["color_rgba"] = merged["status"].map(
+        lambda s: hex_to_rgba(STATUS_COLORS.get(s, DEFAULT_COLOR))
+    )
+    map_rows.append(merged)
+
+if map_rows:
+    map_df = pd.concat(map_rows, ignore_index=True)
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_df[["latitude", "longitude", "status", "provider", "color_rgba", "point_id"]],
+        get_position=["longitude", "latitude"],
+        get_fill_color="color_rgba",
+        get_radius=800,
+        pickable=True,
+        opacity=0.7,
+        radius_min_pixels=2,
+        radius_max_pixels=8,
+    )
+
+    view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.5, pitch=0)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[layer],
+            initial_view_state=view_state,
+            map_style="mapbox://styles/mapbox/dark-v11",
+            tooltip={
+                "html": "<b>{provider}</b><br/>ID: {point_id}<br/>Status: {status}",
+                "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
+            },
+        ),
+        use_container_width=True,
+        height=520,
+    )
+
+    # Legend
+    legend_items = []
+    for status, color in STATUS_COLORS.items():
+        if status in map_df["status"].values:
+            n = int((map_df["status"] == status).sum())
+            legend_items.append(
+                f'<span style="color:{color}">&#9679;</span> {status} ({n:,})'
+            )
+    if legend_items:
+        st.markdown(
+            "&emsp;".join(legend_items),
+            unsafe_allow_html=True,
+        )
+else:
+    st.info("No geolocation data available.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ESTIMATED POWER DRAW TIMELINE
+# ═══════════════════════════════════════════════════════════════════════
+st.subheader("Estimated Power Draw")
+
+power_traces: dict[str, pd.DataFrame] = {}
+snapshot_markers: dict[str, pd.DataFrame] = {}
+
+for slug in selected_providers:
+    timeline, snapshots = load_power_and_snapshots(slug, hours=timeline_hours)
+    if not timeline.empty:
+        power_traces[slug] = timeline
+        snapshot_markers[slug] = snapshots
 
 if power_traces:
-    fig_power = go.Figure()
+    fig = go.Figure()
 
     # Resample all to 1-min and align
     resampled = {}
     for slug, ts in power_traces.items():
-        r = ts.resample("1min").last().ffill()
-        resampled[slug] = r
+        resampled[slug] = ts.resample("1min").last().ffill()
 
-    # Union of indices
     if len(resampled) == 2:
         slugs = list(resampled.keys())
         idx = resampled[slugs[0]].index.union(resampled[slugs[1]].index)
@@ -406,108 +337,83 @@ if power_traces:
             vals[s] = resampled[s].reindex(idx).ffill().fillna(0)["power_mw"]
 
         # Stacked area
-        fig_power.add_trace(
-            go.Scatter(
-                x=idx,
-                y=vals[slugs[0]],
-                name=PROVIDERS[slugs[0]]["label"],
-                fill="tozeroy",
-                line=dict(width=0.5, color=PROVIDERS[slugs[0]]["color"]),
-                fillcolor=PROVIDERS[slugs[0]]["color"].replace(")", ",0.3)").replace(
-                    "rgb", "rgba"
-                )
-                if "rgb" in PROVIDERS[slugs[0]]["color"]
-                else PROVIDERS[slugs[0]]["color"] + "4D",
-            )
-        )
-        fig_power.add_trace(
-            go.Scatter(
-                x=idx,
-                y=vals[slugs[0]] + vals[slugs[1]],
-                name=PROVIDERS[slugs[1]]["label"],
-                fill="tonexty",
-                line=dict(width=0.5, color=PROVIDERS[slugs[1]]["color"]),
-                fillcolor=PROVIDERS[slugs[1]]["color"].replace(")", ",0.3)").replace(
-                    "rgb", "rgba"
-                )
-                if "rgb" in PROVIDERS[slugs[1]]["color"]
-                else PROVIDERS[slugs[1]]["color"] + "4D",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=idx, y=vals[slugs[0]],
+            name=PROVIDERS[slugs[0]]["label"],
+            fill="tozeroy",
+            line=dict(width=0.5, color=PROVIDERS[slugs[0]]["color"]),
+            fillcolor=hex_to_rgba_str(PROVIDERS[slugs[0]]["color"]),
+            hovertemplate="%{y:.0f} MW<extra>" + PROVIDERS[slugs[0]]["label"] + "</extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=idx, y=vals[slugs[0]] + vals[slugs[1]],
+            name=PROVIDERS[slugs[1]]["label"],
+            fill="tonexty",
+            line=dict(width=0.5, color=PROVIDERS[slugs[1]]["color"]),
+            fillcolor=hex_to_rgba_str(PROVIDERS[slugs[1]]["color"]),
+            hovertemplate="%{y:.0f} MW<extra>Total</extra>",
+        ))
     else:
         for slug, ts in resampled.items():
-            fig_power.add_trace(
-                go.Scatter(
-                    x=ts.index,
-                    y=ts["power_mw"],
-                    name=PROVIDERS[slug]["label"],
-                    fill="tozeroy",
-                    line=dict(width=1, color=PROVIDERS[slug]["color"]),
-                )
-            )
+            fig.add_trace(go.Scatter(
+                x=ts.index, y=ts["power_mw"],
+                name=PROVIDERS[slug]["label"],
+                fill="tozeroy",
+                line=dict(width=1, color=PROVIDERS[slug]["color"]),
+                hovertemplate="%{y:.0f} MW<extra>" + PROVIDERS[slug]["label"] + "</extra>",
+            ))
 
-    fig_power.update_layout(
-        height=350,
-        margin=dict(l=0, r=0, t=10, b=0),
-        yaxis_title="MW (nameplate)",
+    # ── SNAPSHOT markers ──────────────────────────────────────────────
+    # Collect all unique SNAPSHOT timestamps across providers
+    snap_times = set()
+    for slug, snaps in snapshot_markers.items():
+        for t in snaps["time"]:
+            snap_times.add(t)
+
+    for snap_t in sorted(snap_times):
+        fig.add_vline(
+            x=snap_t,
+            line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dash"),
+            annotation=dict(
+                text="SNAPSHOT",
+                font=dict(size=9, color="rgba(255,255,255,0.5)"),
+                yref="paper", y=1.0,
+                showarrow=False,
+            ),
+        )
+
+    fig.update_layout(
+        height=400,
+        margin=dict(l=0, r=0, t=30, b=0),
+        yaxis_title="MW (nameplate rating)",
         xaxis_title="",
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         hovermode="x unified",
         plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
     )
-    fig_power.update_xaxes(gridcolor="rgba(128,128,128,0.15)")
-    fig_power.update_yaxes(gridcolor="rgba(128,128,128,0.15)", rangemode="tozero")
-    st.plotly_chart(fig_power, use_container_width=True)
+    fig.update_xaxes(gridcolor="rgba(128,128,128,0.12)")
+    fig.update_yaxes(gridcolor="rgba(128,128,128,0.12)", rangemode="tozero")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Dashed vertical lines mark **SNAPSHOT** deliveries -- full ground-truth state "
+        "resets from the upstream data provider. Between snapshots, values are derived "
+        "from incremental delta updates and may overestimate actual usage due to missed "
+        "status transitions. "
+        "Power is estimated as: sum of nameplate-rated power across all in-use charging points."
+    )
 else:
     st.info("No power-draw data available for the selected window.")
 
-# ── Usage timeline (snapshot_runs aggregation) ────────────────────────
-st.subheader("Network Utilisation Over Time")
-
-usage_fig = go.Figure()
-for slug in selected_providers:
-    runs = load_snapshot_runs(slug, hours=timeline_hours)
-    cfg = PROVIDERS[slug]
-    if runs.empty:
-        continue
-    runs["collected_at_utc"] = pd.to_datetime(runs["collected_at_utc"])
-    # Only SNAPSHOT rows give full-network state
-    snap = runs[runs["delivery_type"] == "SNAPSHOT"].copy()
-    if snap.empty:
-        continue
-    in_use_col = cfg["in_use_col"]
-    snap["usage_pct"] = snap[in_use_col] / snap["point_count"] * 100
-
-    usage_fig.add_trace(
-        go.Scatter(
-            x=snap["collected_at_utc"],
-            y=snap["usage_pct"],
-            name=cfg["label"],
-            mode="lines",
-            line=dict(width=1.5, color=cfg["color"]),
-        )
-    )
-
-usage_fig.update_layout(
-    height=300,
-    margin=dict(l=0, r=0, t=10, b=0),
-    yaxis_title="% points in use",
-    xaxis_title="",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    hovermode="x unified",
-    plot_bgcolor="rgba(0,0,0,0)",
-)
-usage_fig.update_xaxes(gridcolor="rgba(128,128,128,0.15)")
-usage_fig.update_yaxes(gridcolor="rgba(128,128,128,0.15)", rangemode="tozero")
-st.plotly_chart(usage_fig, use_container_width=True)
 
 # ── Footer ────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    "Data source: [Mobilithek](https://mobilithek.info) — "
-    "AFIR-mandated DATEX II feeds from German CPOs.  "
-    "Power estimates use nameplate ratings; actual draw depends on "
-    "vehicle SOC, cable limits, and load management."
+    "Data: [Mobilithek](https://mobilithek.info) AFIR / DATEX II feeds "
+    "&ensp;|&ensp; "
+    "This is an experimental research tool. No guarantees are made regarding "
+    "accuracy or completeness. See README for details."
 )
 
 # ── Auto-refresh ──────────────────────────────────────────────────────

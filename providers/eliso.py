@@ -40,6 +40,8 @@ class ElisoProvider(Provider):
     slug = "eliso"
     tracked_columns = ["status", "operational_status"]
     in_use_status = "In use"
+    power_column = "point_power_kw"
+    power_to_mw = 1e-3
 
     @property
     def in_use_count_column(self) -> str:

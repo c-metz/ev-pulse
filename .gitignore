@@ -1,8 +1,10 @@
-# Credentials
+# Credentials & certificates
 .env
-certificate.p12
+*.p12
+*.pem
+*.key
 
-# Data (large SQLite databases — produced by the collector)
+# Data (large SQLite databases produced by the collector)
 data/
 
 # Sample source files (large DATEX II JSON payloads)
@@ -12,13 +14,28 @@ sources/
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
 
-# Probe / scratch scripts
-_probe*.py
+# Scratch / probe scripts
+_*.py
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Misc
-output.png
-.claude/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+output*.png
+.claude/
+
+# Unrelated analysis notebooks
+portugal_*.ipynb

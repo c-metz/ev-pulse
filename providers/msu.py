@@ -39,6 +39,8 @@ class MsuProvider(Provider):
     slug = "msu"
     tracked_columns = ["status"]
     in_use_status = "occupied"
+    power_column = "point_power_w"
+    power_to_mw = 1e-6
 
     # ── Schema ────────────────────────────────────────────────────────
     def static_table_ddl(self) -> str:
