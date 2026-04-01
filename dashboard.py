@@ -117,7 +117,7 @@ def load_static(slug: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load pre-computed MW timeline and SNAPSHOT timestamps."""
+    """Load MW timeline with drift correction, plus SNAPSHOT timestamps."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
     if not db.exists():
@@ -135,27 +135,14 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         if "estimated_power_mw" not in cols:
             return empty
 
-        # Power timeline (DELTA + SNAPSHOT rows that have a value)
         power_df = pd.read_sql_query(
             """
             SELECT collected_at_utc AS time,
-                   estimated_power_mw AS power_mw
+                   estimated_power_mw AS power_mw,
+                   delivery_type
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
               AND estimated_power_mw IS NOT NULL
-            ORDER BY snapshot_id
-            """,
-            conn,
-            params=(cutoff,),
-        )
-
-        # SNAPSHOT timestamps (independent of estimated_power_mw)
-        snap_df = pd.read_sql_query(
-            """
-            SELECT collected_at_utc AS time
-            FROM snapshot_runs
-            WHERE collected_at_utc >= ?
-              AND delivery_type = 'SNAPSHOT'
             ORDER BY snapshot_id
             """,
             conn,
@@ -166,8 +153,39 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         return empty
 
     power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
-    snap_df["time"] = pd.to_datetime(snap_df["time"], format="ISO8601")
-    timeline = power_df.set_index("time").sort_index()
+
+    # ── Proportional drift correction ────────────────────────────────
+    # Between consecutive SNAPSHOTs the delta-accumulated power drifts
+    # upward.  Linearly distribute the error so the curve is smooth and
+    # matches ground truth at both SNAPSHOT endpoints.
+    snap_mask = power_df["delivery_type"] == "SNAPSHOT"
+    snap_indices = power_df.index[snap_mask].tolist()
+    power_vals = power_df["power_mw"].values.copy()
+    times = power_df["time"].values  # numpy datetime64
+
+    for i in range(len(snap_indices) - 1):
+        idx_a = snap_indices[i]
+        idx_b = snap_indices[i + 1]
+        if idx_b <= idx_a + 1:
+            continue
+        power_at_b = power_vals[idx_b]
+        power_before_b = power_vals[idx_b - 1]
+        jump = power_before_b - power_at_b
+        if abs(jump) < 0.01:
+            continue
+        t_a = times[idx_a].astype("int64")
+        t_b = times[idx_b].astype("int64")
+        span = t_b - t_a
+        if span <= 0:
+            continue
+        for j in range(idx_a + 1, idx_b):
+            frac = (times[j].astype("int64") - t_a) / span
+            power_vals[j] -= jump * frac
+
+    power_df["power_mw"] = power_vals
+
+    snap_df = power_df.loc[snap_mask, ["time"]].copy()
+    timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
     return timeline, snap_df
 
