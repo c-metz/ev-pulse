@@ -165,8 +165,8 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
     if power_df.empty:
         return empty
 
-    power_df["time"] = pd.to_datetime(power_df["time"])
-    snap_df["time"] = pd.to_datetime(snap_df["time"])
+    power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
+    snap_df["time"] = pd.to_datetime(snap_df["time"], format="ISO8601")
     timeline = power_df.set_index("time").sort_index()
 
     return timeline, snap_df
