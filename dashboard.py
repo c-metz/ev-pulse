@@ -12,6 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
@@ -194,11 +195,11 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
     # Drop remaining NULL rows (non-SNAPSHOT rows missing power)
     power_df = power_df.dropna(subset=["power_mw"]).reset_index(drop=True)
 
-    # ── Proportional drift correction ────────────────────────────────
+    # ── Proportional drift correction (vectorised) ─────────────────
     snap_mask = power_df["delivery_type"] == "SNAPSHOT"
     snap_indices = power_df.index[snap_mask].tolist()
     power_vals = power_df["power_mw"].values.copy()
-    times = power_df["time"].values
+    times_i64 = power_df["time"].values.astype("int64")
 
     for i in range(len(snap_indices) - 1):
         idx_a = snap_indices[i]
@@ -210,14 +211,14 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         jump = power_before_b - power_at_b
         if abs(jump) < 0.01:
             continue
-        t_a = times[idx_a].astype("int64")
-        t_b = times[idx_b].astype("int64")
+        t_a = times_i64[idx_a]
+        t_b = times_i64[idx_b]
         span = t_b - t_a
         if span <= 0:
             continue
-        for j in range(idx_a + 1, idx_b):
-            frac = (times[j].astype("int64") - t_a) / span
-            power_vals[j] -= jump * frac
+        sl = slice(idx_a + 1, idx_b)
+        frac = (times_i64[sl] - t_a) / span
+        power_vals[sl] -= jump * frac
 
     power_df["power_mw"] = power_vals
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
@@ -440,15 +441,22 @@ if power_traces:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Download: timeline as interactive HTML ──────────────────────────
-    html_bytes = fig.to_html(include_plotlyjs="cdn").encode()
-    st.download_button(
-        label="📥 Download timeline (.html)",
-        data=html_bytes,
-        file_name=f"ev_pulse_timeline_{datetime.now(timezone.utc):%Y%m%d_%H%M}.html",
-        mime="text/html",
-    )
-    st.caption("💡 *Tip: use the 📷 icon in the chart toolbar above to save a PNG screenshot.*")
+    # ── Download: timeline data as CSV ──────────────────────────────────
+    csv_frames = []
+    for slug, ts in power_traces.items():
+        col_name = PROVIDERS[slug]["label"]
+        resampled = ts.resample("1min").last().ffill()
+        resampled = resampled.rename(columns={"power_mw": f"{col_name} (MW)"})
+        csv_frames.append(resampled)
+    if csv_frames:
+        csv_df = pd.concat(csv_frames, axis=1).sort_index()
+        csv_df.index.name = "time_utc"
+        st.download_button(
+            label="📥 Download data (.csv)",
+            data=csv_df.to_csv(),
+            file_name=f"ev_pulse_data_{datetime.now(timezone.utc):%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+        )
 
     st.caption(
         "Dashed lines = **SNAPSHOT** ground truth. "
