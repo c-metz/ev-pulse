@@ -163,7 +163,16 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         if "estimated_power_mw" not in cols:
             return empty
 
-        # Fetch ALL rows (including NULLs) so SNAPSHOT anchors aren't lost
+        # Find the last SNAPSHOT *before* the cutoff so we have a left
+        # anchor for drift correction on the first visible segment.
+        anchor_row = conn.execute(
+            "SELECT collected_at_utc FROM snapshot_runs "
+            "WHERE delivery_type = 'SNAPSHOT' AND collected_at_utc < ? "
+            "ORDER BY snapshot_id DESC LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        effective_cutoff = anchor_row[0] if anchor_row else cutoff
+
         power_df = pd.read_sql_query(
             """
             SELECT collected_at_utc AS time,
@@ -174,7 +183,7 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
             ORDER BY snapshot_id
             """,
             conn,
-            params=(cutoff,),
+            params=(effective_cutoff,),
         )
 
     if power_df.empty:
@@ -221,7 +230,13 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         power_vals[sl] -= jump * frac
 
     power_df["power_mw"] = power_vals
+
+    # Trim back to the user-requested window (we fetched extra for the
+    # left SNAPSHOT anchor, but the chart should only show `hours`).
+    visible_cutoff = pd.Timestamp(cutoff, tz="UTC")
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
+    snap_df = snap_df[snap_df["time"] >= visible_cutoff]
+    power_df = power_df[power_df["time"] >= visible_cutoff].copy()
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
     return timeline, snap_df
