@@ -16,6 +16,9 @@ and how much power the network is drawing.
 | Polling interval | ~60 s (delta-pull) |
 | Ground-truth refresh | ~1x / day (SNAPSHOT delivery) |
 
+**[▶ Live Dashboard](http://178.104.101.146:8501)** — interactive map
+and power-draw timeline, updated every 60 seconds.
+
 ---
 
 ## Architecture

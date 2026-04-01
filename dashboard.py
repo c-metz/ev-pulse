@@ -8,9 +8,9 @@ Run:
 """
 from __future__ import annotations
 
-import json
+import io
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -77,7 +77,6 @@ def hex_to_rgba(hex_str: str, alpha: int = 180) -> list[int]:
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600)
 def load_bundeslaender() -> dict | None:
-    """Fetch simplified German state boundaries (cached 1 h)."""
     try:
         resp = requests.get(BUNDESLAENDER_GEOJSON_URL, timeout=15)
         resp.raise_for_status()
@@ -113,6 +112,35 @@ def load_static(slug: str) -> pd.DataFrame:
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
         return pd.read_sql_query("SELECT * FROM charging_points", conn)
+
+
+@st.cache_data(ttl=60)
+def load_snapshot_meta(slug: str) -> dict:
+    """Load SNAPSHOT metadata for data quality reporting."""
+    db = DATA_DIR / f"{slug}_dynamic.sqlite"
+    meta: dict = {"snapshots": 0, "last_snapshot": None, "last_snapshot_age_h": None,
+                  "total_runs": 0, "first_data": None}
+    if not db.exists():
+        return meta
+    with sqlite3.connect(db) as conn:
+        meta["total_runs"] = conn.execute("SELECT COUNT(*) FROM snapshot_runs").fetchone()[0]
+        snaps = conn.execute(
+            "SELECT collected_at_utc FROM snapshot_runs "
+            "WHERE delivery_type = 'SNAPSHOT' ORDER BY snapshot_id"
+        ).fetchall()
+        meta["snapshots"] = len(snaps)
+        if snaps:
+            last = datetime.fromisoformat(snaps[-1][0])
+            meta["last_snapshot"] = last
+            meta["last_snapshot_age_h"] = (
+                datetime.now(timezone.utc) - last
+            ).total_seconds() / 3600
+        first = conn.execute(
+            "SELECT collected_at_utc FROM snapshot_runs ORDER BY snapshot_id LIMIT 1"
+        ).fetchone()
+        if first:
+            meta["first_data"] = datetime.fromisoformat(first[0])
+    return meta
 
 
 @st.cache_data(ttl=60)
@@ -155,13 +183,10 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
     power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
 
     # ── Proportional drift correction ────────────────────────────────
-    # Between consecutive SNAPSHOTs the delta-accumulated power drifts
-    # upward.  Linearly distribute the error so the curve is smooth and
-    # matches ground truth at both SNAPSHOT endpoints.
     snap_mask = power_df["delivery_type"] == "SNAPSHOT"
     snap_indices = power_df.index[snap_mask].tolist()
     power_vals = power_df["power_mw"].values.copy()
-    times = power_df["time"].values  # numpy datetime64
+    times = power_df["time"].values
 
     for i in range(len(snap_indices) - 1):
         idx_a = snap_indices[i]
@@ -183,7 +208,6 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
             power_vals[j] -= jump * frac
 
     power_df["power_mw"] = power_vals
-
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
@@ -218,12 +242,43 @@ with st.sidebar:
     timeline_hours = st.slider("Timeline window (hours)", 6, 168, 48, step=6)
     auto_refresh = st.toggle("Auto-refresh (60 s)", value=False)
 
+    # ── Data quality panel ────────────────────────────────────────────
+    st.divider()
+    st.subheader("Data Quality")
+
+    for slug in selected_providers:
+        cfg = PROVIDERS[slug]
+        meta = load_snapshot_meta(slug)
+        age_str = (
+            f"{meta['last_snapshot_age_h']:.0f} h ago"
+            if meta["last_snapshot_age_h"] is not None
+            else "never"
+        )
+        st.markdown(f"**{cfg['label']}**")
+        col1, col2 = st.columns(2)
+        col1.metric("SNAPSHOTs", meta["snapshots"])
+        col2.metric("Last SNAPSHOT", age_str)
+
     st.divider()
     st.caption(
-        "**Data quality** -- Dashed vertical lines on the timeline mark "
-        "**SNAPSHOT** deliveries (ground truth). Between snapshots, values "
-        "are derived from incremental deltas and may drift upward. "
-        "Power = nameplate rating x (1 if in use, 0 otherwise)."
+        "**Methodology** -- Dashed vertical lines on the timeline mark "
+        "**SNAPSHOT** deliveries (complete ground-truth state resets from "
+        "the upstream data provider). Between snapshots, the state is "
+        "reconstructed from incremental **DELTA** updates via Mobilithek's "
+        "delta-pull protocol. "
+        "Because some status transitions are missed between polls "
+        "(the Mobilithek packet buffer overwrites unread deliveries), "
+        "the accumulated state drifts -- typically overestimating active "
+        "chargers. A **proportional drift correction** is applied: the "
+        "error is linearly distributed between consecutive SNAPSHOT "
+        "anchors, preserving the shape of intraday fluctuations. "
+        "Intervals with only one or zero SNAPSHOTs cannot be corrected."
+    )
+    st.caption(
+        "**Power estimation** -- "
+        "P = SUM(nameplate_rated_kW) for all points with status = in_use. "
+        "This is an upper bound. Actual grid draw depends on vehicle SOC, "
+        "charging curve, cable limits, and load management."
     )
 
 # ── Load data ─────────────────────────────────────────────────────────
@@ -263,7 +318,6 @@ if map_rows:
 
     layers = []
 
-    # Bundesland border overlay
     geojson = load_bundeslaender()
     if geojson is not None:
         layers.append(
@@ -278,7 +332,6 @@ if map_rows:
             )
         )
 
-    # Charging point scatter
     layers.append(
         pdk.Layer(
             "ScatterplotLayer",
@@ -313,7 +366,7 @@ else:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  POWER DRAW TIMELINE  (per-provider lines, not stacked)
+#  POWER DRAW TIMELINE  (per-provider lines, drift-corrected)
 # ═══════════════════════════════════════════════════════════════════════
 
 power_traces: dict[str, pd.DataFrame] = {}
@@ -348,8 +401,6 @@ if power_traces:
 
     for snap_t in sorted(snap_times):
         x_val = pd.Timestamp(snap_t).to_pydatetime()
-        # Use add_shape + add_annotation separately — Plotly's add_vline
-        # with annotation triggers a _mean() call that fails on dates.
         fig.add_shape(
             type="line", x0=x_val, x1=x_val,
             y0=0, y1=1, yref="paper",
@@ -374,12 +425,23 @@ if power_traces:
     )
     fig.update_xaxes(gridcolor="rgba(128,128,128,0.12)")
     fig.update_yaxes(gridcolor="rgba(128,128,128,0.12)", rangemode="tozero")
+
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── Download: timeline as PNG ─────────────────────────────────────
+    png_bytes = fig.to_image(format="png", width=1400, height=400, scale=2)
+    st.download_button(
+        label="Download timeline (.png)",
+        data=png_bytes,
+        file_name=f"ev_pulse_timeline_{datetime.now(timezone.utc):%Y%m%d_%H%M}.png",
+        mime="image/png",
+    )
 
     st.caption(
         "Dashed lines = **SNAPSHOT** ground truth. "
-        "Between snapshots, power is estimated from incremental deltas (may drift upward). "
-        "Power = sum of nameplate-rated kW for all in-use points."
+        "Between snapshots, a proportional drift correction is applied "
+        "to compensate for missed delta transitions. "
+        "Power = SUM(nameplate-rated kW) for all in-use points."
     )
 else:
     st.info("No power-draw data available for the selected window.")
@@ -390,8 +452,9 @@ st.divider()
 st.caption(
     "Data: [Mobilithek](https://mobilithek.info) AFIR / DATEX II feeds "
     "&ensp;|&ensp; "
-    "Experimental research tool -- no guarantees on accuracy. "
-    "See README for details."
+    "[Source code](https://github.com/c-metz/ev-pulse) "
+    "&ensp;|&ensp; "
+    "Experimental research tool -- no guarantees on accuracy or completeness."
 )
 
 # ── Auto-refresh ──────────────────────────────────────────────────────
