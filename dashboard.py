@@ -144,34 +144,17 @@ def load_snapshot_meta(slug: str) -> dict:
 
 
 @st.cache_data(ttl=60)
-def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load MW timeline with drift correction, plus SNAPSHOT timestamps."""
+def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the full MW timeline with drift correction, plus SNAPSHOT timestamps."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
     if not db.exists():
         return empty
 
-    cutoff = (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .__sub__(pd.Timedelta(hours=hours))
-        .isoformat()
-    )
-
     with sqlite3.connect(db) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
         if "estimated_power_mw" not in cols:
             return empty
-
-        # Find the last SNAPSHOT *before* the cutoff so we have a left
-        # anchor for drift correction on the first visible segment.
-        anchor_row = conn.execute(
-            "SELECT collected_at_utc FROM snapshot_runs "
-            "WHERE delivery_type = 'SNAPSHOT' AND collected_at_utc < ? "
-            "ORDER BY snapshot_id DESC LIMIT 1",
-            (cutoff,),
-        ).fetchone()
-        effective_cutoff = anchor_row[0] if anchor_row else cutoff
 
         power_df = pd.read_sql_query(
             """
@@ -179,11 +162,9 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
                    estimated_power_mw AS power_mw,
                    delivery_type
             FROM snapshot_runs
-            WHERE collected_at_utc >= ?
             ORDER BY snapshot_id
             """,
             conn,
-            params=(effective_cutoff,),
         )
 
     if power_df.empty:
@@ -192,16 +173,12 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
     power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
 
     # ── Fill NULL power on SNAPSHOT rows ─────────────────────────────
-    # Old SNAPSHOT rows may lack estimated_power_mw.  For each NULL
-    # SNAPSHOT, use the first non-NULL row after it (the initial DELTA
-    # after reset reflects the correct post-SNAPSHOT state).
     snap_mask = power_df["delivery_type"] == "SNAPSHOT"
     for idx in power_df.index[snap_mask & power_df["power_mw"].isna()]:
         after = power_df.loc[idx + 1:, "power_mw"].dropna()
         if not after.empty:
             power_df.at[idx, "power_mw"] = after.iloc[0]
 
-    # Drop remaining NULL rows (non-SNAPSHOT rows missing power)
     power_df = power_df.dropna(subset=["power_mw"]).reset_index(drop=True)
 
     # ── Proportional drift correction (vectorised) ─────────────────
@@ -231,15 +208,99 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
 
     power_df["power_mw"] = power_vals
 
-    # Trim back to the user-requested window (we fetched extra for the
-    # left SNAPSHOT anchor, but the chart should only show `hours`).
-    visible_cutoff = pd.Timestamp(cutoff, tz="UTC")
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
-    snap_df = snap_df[snap_df["time"] >= visible_cutoff]
-    power_df = power_df[power_df["time"] >= visible_cutoff].copy()
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
+    # Return the last SNAPSHOT time for uncorrected-region shading
     return timeline, snap_df
+
+
+# ── Map animation frames ─────────────────────────────────────────────
+
+@st.cache_data(ttl=120)
+def _load_transitions_and_initial(slugs: tuple[str, ...]) -> tuple[dict, pd.DataFrame]:
+    """Load initial state (from first SNAPSHOT) and all subsequent transitions."""
+    initial: dict[str, str] = {}    # point_id -> status
+    trans_parts = []
+
+    for slug in slugs:
+        db = DATA_DIR / f"{slug}_dynamic.sqlite"
+        if not db.exists():
+            continue
+        conn = sqlite3.connect(db)
+        snap_row = conn.execute(
+            "SELECT snapshot_id FROM snapshot_runs "
+            "WHERE delivery_type = 'SNAPSHOT' ORDER BY snapshot_id LIMIT 1"
+        ).fetchone()
+        if not snap_row:
+            conn.close()
+            continue
+        snap_id = snap_row[0]
+
+        for pid, status in conn.execute(
+            "SELECT point_id, status FROM point_status_history WHERE snapshot_id = ?",
+            (snap_id,),
+        ):
+            initial[pid] = status
+
+        t = pd.read_sql_query(
+            "SELECT collected_at_utc, point_id, status FROM point_status_history "
+            "WHERE snapshot_id > ? ORDER BY id",
+            conn, params=(snap_id,),
+        )
+        t["collected_at_utc"] = pd.to_datetime(t["collected_at_utc"], format="ISO8601")
+        trans_parts.append(t)
+        conn.close()
+
+    if trans_parts:
+        transitions = pd.concat(trans_parts).sort_values("collected_at_utc").reset_index(drop=True)
+    else:
+        transitions = pd.DataFrame(columns=["collected_at_utc", "point_id", "status"])
+
+    return initial, transitions
+
+
+@st.cache_data(ttl=120)
+def load_map_frames(
+    slugs: tuple[str, ...],
+    interval_minutes: int = 60,
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Precompute {point_id: status} at regular intervals.
+
+    Returns (list of ISO timestamp strings, dict mapping each timestamp
+    to a {point_id: status} dict).
+    """
+    initial, transitions = _load_transitions_and_initial(slugs)
+    if not initial:
+        return [], {}
+
+    t_min = transitions["collected_at_utc"].min() if len(transitions) else pd.Timestamp.now("UTC")
+    t_max = pd.Timestamp.now(timezone.utc)
+    frame_times = pd.date_range(
+        t_min.ceil(f"{interval_minutes}min"), t_max, freq=f"{interval_minutes}min"
+    )
+    if frame_times.empty:
+        return [], {}
+
+    state = dict(initial)
+    trans_times = transitions["collected_at_utc"].values
+    trans_pids = transitions["point_id"].values
+    trans_stats = transitions["status"].values
+    n_trans = len(transitions)
+    trans_idx = 0
+
+    frames: dict[str, dict[str, str]] = {}
+    frame_labels: list[str] = []
+
+    for ft in frame_times:
+        ft_np = ft.to_datetime64()
+        while trans_idx < n_trans and trans_times[trans_idx] <= ft_np:
+            state[trans_pids[trans_idx]] = trans_stats[trans_idx]
+            trans_idx += 1
+        frames[ft.isoformat()] = dict(state)
+        frame_labels.append(ft.isoformat())
+
+    return frame_labels, frames
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -267,7 +328,6 @@ with st.sidebar:
         default=list(PROVIDERS.keys()),
         format_func=lambda s: PROVIDERS[s]["label"],
     )
-    timeline_hours = st.slider("Timeline window (hours)", 6, 168, 48, step=6)
     auto_refresh = st.toggle("Auto-refresh (60 s)", value=False)
 
     # ── Data quality panel ────────────────────────────────────────────
@@ -300,7 +360,7 @@ with st.sidebar:
         "chargers. A **proportional drift correction** is applied: the "
         "error is linearly distributed between consecutive SNAPSHOT "
         "anchors, preserving the shape of intraday fluctuations. "
-        "Intervals with only one or zero SNAPSHOTs cannot be corrected."
+        "The shaded region after the last SNAPSHOT has not been corrected."
     )
     st.caption(
         "**Power estimation** -- "
@@ -319,8 +379,53 @@ for slug in selected_providers:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  MAP  (with Bundesland borders)
+#  LIVE MAP  (current state, with Bundesland borders)
 # ═══════════════════════════════════════════════════════════════════════
+
+LEGEND_ITEMS = [
+    ("#2ecc71", "Available"),
+    ("#e74c3c", "Charging / Occupied"),
+    ("#f39c12", "Reserved"),
+    ("#e67e22", "Blocked"),
+    ("#95a5a6", "Out of service / Inoperative"),
+    ("#bdc3c7", "Unknown"),
+    ("#7f8c8d", "Removed"),
+]
+
+# ── Helper: build pydeck layers from a DataFrame ─────────────────────
+geojson_data = load_bundeslaender()
+
+
+def _build_map_layers(df: pd.DataFrame) -> list:
+    """Return pydeck layers for a map DataFrame with color_rgba column."""
+    layers = []
+    if geojson_data is not None:
+        layers.append(
+            pdk.Layer(
+                "GeoJsonLayer",
+                data=geojson_data,
+                stroked=True,
+                filled=False,
+                get_line_color=[255, 255, 255, 70],
+                line_width_min_pixels=1,
+                pickable=False,
+            )
+        )
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position=["longitude", "latitude"],
+            get_fill_color="color_rgba",
+            get_radius=800,
+            pickable=True,
+            opacity=0.7,
+            radius_min_pixels=2,
+            radius_max_pixels=8,
+        )
+    )
+    return layers
+
 
 map_rows = []
 for slug in selected_providers:
@@ -343,42 +448,13 @@ for slug in selected_providers:
 
 if map_rows:
     map_df = pd.concat(map_rows, ignore_index=True)
-
-    layers = []
-
-    geojson = load_bundeslaender()
-    if geojson is not None:
-        layers.append(
-            pdk.Layer(
-                "GeoJsonLayer",
-                data=geojson,
-                stroked=True,
-                filled=False,
-                get_line_color=[255, 255, 255, 70],
-                line_width_min_pixels=1,
-                pickable=False,
-            )
-        )
-
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=map_df[["latitude", "longitude", "status", "provider", "color_rgba", "point_id"]],
-            get_position=["longitude", "latitude"],
-            get_fill_color="color_rgba",
-            get_radius=800,
-            pickable=True,
-            opacity=0.7,
-            radius_min_pixels=2,
-            radius_max_pixels=8,
-        )
-    )
-
     view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.5, pitch=0)
 
     st.pydeck_chart(
         pdk.Deck(
-            layers=layers,
+            layers=_build_map_layers(
+                map_df[["latitude", "longitude", "status", "provider", "color_rgba", "point_id"]]
+            ),
             initial_view_state=view_state,
             map_style="mapbox://styles/mapbox/dark-v11",
             tooltip={
@@ -390,18 +466,6 @@ if map_rows:
         height=560,
     )
 
-    # ── Map legend ────────────────────────────────────────────────────
-    # De-duplicate colours: several statuses share the same colour, so
-    # group them into human-readable labels.
-    LEGEND_ITEMS = [
-        ("#2ecc71", "Available"),
-        ("#e74c3c", "Charging / Occupied"),
-        ("#f39c12", "Reserved"),
-        ("#e67e22", "Blocked"),
-        ("#95a5a6", "Out of service / Inoperative"),
-        ("#bdc3c7", "Unknown"),
-        ("#7f8c8d", "Removed"),
-    ]
     legend_html = " &nbsp; ".join(
         f'<span style="display:inline-flex;align-items:center;margin-right:6px">'
         f'<span style="display:inline-block;width:12px;height:12px;'
@@ -415,14 +479,128 @@ else:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  POWER DRAW TIMELINE  (per-provider lines, drift-corrected)
+#  MAP TIME-LAPSE  (animated historical replay)
 # ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.subheader("Time-lapse: charging activity over time")
+
+# Build static lookup: point_id -> (lat, lon, provider_label)
+static_lookup: dict[str, tuple[float, float, str]] = {}
+for slug in selected_providers:
+    static = all_statics.get(slug)
+    if static is None or static.empty:
+        continue
+    label = PROVIDERS[slug]["label"]
+    for _, row in static[["point_id", "latitude", "longitude"]].dropna().iterrows():
+        static_lookup[row["point_id"]] = (row["latitude"], row["longitude"], label)
+
+slugs_tuple = tuple(selected_providers)
+frame_labels, frames = load_map_frames(slugs_tuple, interval_minutes=60)
+
+if frame_labels:
+    # ── Session-state for playback ────────────────────────────────
+    if "anim_idx" not in st.session_state:
+        st.session_state.anim_idx = len(frame_labels) - 1
+    if "playing" not in st.session_state:
+        st.session_state.playing = False
+
+    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1, 1, 1, 6])
+    with ctrl_col1:
+        if st.button("⏮", help="First frame"):
+            st.session_state.anim_idx = 0
+            st.session_state.playing = False
+    with ctrl_col2:
+        if st.button("▶ Play" if not st.session_state.playing else "⏸ Pause"):
+            st.session_state.playing = not st.session_state.playing
+    with ctrl_col3:
+        if st.button("⏭", help="Last frame (now)"):
+            st.session_state.anim_idx = len(frame_labels) - 1
+            st.session_state.playing = False
+
+    frame_idx = st.slider(
+        "Time (UTC)",
+        min_value=0,
+        max_value=len(frame_labels) - 1,
+        value=st.session_state.anim_idx,
+        format="",
+        key="frame_slider",
+    )
+    st.session_state.anim_idx = frame_idx
+
+    selected_time = frame_labels[frame_idx]
+    selected_ts = pd.Timestamp(selected_time)
+    st.caption(f"**{selected_ts:%Y-%m-%d %H:%M UTC}**")
+
+    # Build the map frame
+    state_dict = frames[selected_time]
+    frame_rows = []
+    for pid, status in state_dict.items():
+        loc = static_lookup.get(pid)
+        if loc is None:
+            continue
+        lat, lon, provider = loc
+        frame_rows.append({
+            "latitude": lat,
+            "longitude": lon,
+            "status": status,
+            "provider": provider,
+            "point_id": pid,
+            "color_rgba": hex_to_rgba(STATUS_COLORS.get(status, DEFAULT_COLOR)),
+        })
+
+    if frame_rows:
+        frame_df = pd.DataFrame(frame_rows)
+        # Stats for this frame
+        n_charging = frame_df["status"].isin(["charging", "occupied"]).sum()
+        n_available = (frame_df["status"] == "available").sum()
+        n_other = len(frame_df) - n_charging - n_available
+
+        stat_c1, stat_c2, stat_c3 = st.columns(3)
+        stat_c1.metric("Charging / Occupied", f"{n_charging:,}")
+        stat_c2.metric("Available", f"{n_available:,}")
+        stat_c3.metric("Other", f"{n_other:,}")
+
+        anim_view = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.5, pitch=0)
+        st.pydeck_chart(
+            pdk.Deck(
+                layers=_build_map_layers(frame_df),
+                initial_view_state=anim_view,
+                map_style="mapbox://styles/mapbox/dark-v11",
+                tooltip={
+                    "html": "<b>{provider}</b><br/>ID: {point_id}<br/>Status: {status}",
+                    "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
+                },
+            ),
+            use_container_width=True,
+            height=500,
+        )
+        st.markdown(legend_html if map_rows else "", unsafe_allow_html=True)
+
+    # Auto-advance when playing
+    if st.session_state.playing:
+        import time as _time
+        if st.session_state.anim_idx < len(frame_labels) - 1:
+            _time.sleep(0.6)
+            st.session_state.anim_idx += 1
+            st.rerun()
+        else:
+            st.session_state.playing = False
+else:
+    st.info("Not enough historical data for the time-lapse animation.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  POWER DRAW TIMELINE  (per-provider lines, drift-corrected, ALL data)
+# ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
 
 power_traces: dict[str, pd.DataFrame] = {}
 snapshot_markers: dict[str, pd.DataFrame] = {}
 
 for slug in selected_providers:
-    timeline, snapshots = load_power_and_snapshots(slug, hours=timeline_hours)
+    timeline, snapshots = load_power_and_snapshots(slug)
     if not timeline.empty:
         power_traces[slug] = timeline
         snapshot_markers[slug] = snapshots
@@ -442,11 +620,13 @@ if power_traces:
             hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
         ))
 
-    # SNAPSHOT markers
+    # ── SNAPSHOT markers ──────────────────────────────────────────────
     snap_times = set()
     for snaps in snapshot_markers.values():
         for t in snaps["time"]:
             snap_times.add(t)
+
+    last_snap_time = max(snap_times) if snap_times else None
 
     for snap_t in sorted(snap_times):
         x_val = pd.Timestamp(snap_t).to_pydatetime()
@@ -461,6 +641,28 @@ if power_traces:
             font=dict(size=9, color="rgba(255,255,255,0.45)"),
             showarrow=False, yanchor="bottom",
         )
+
+    # ── Shaded uncorrected region after last SNAPSHOT ─────────────────
+    if last_snap_time is not None:
+        x_end = max(ts.index.max() for ts in power_traces.values())
+        last_snap_dt = pd.Timestamp(last_snap_time).to_pydatetime()
+        x_end_dt = pd.Timestamp(x_end).to_pydatetime()
+        if x_end_dt > last_snap_dt:
+            fig.add_shape(
+                type="rect",
+                x0=last_snap_dt, x1=x_end_dt,
+                y0=0, y1=1, yref="paper",
+                fillcolor="rgba(255, 165, 0, 0.07)",
+                line=dict(width=0),
+                layer="below",
+            )
+            mid_x = last_snap_dt + (x_end_dt - last_snap_dt) / 2
+            fig.add_annotation(
+                x=mid_x, y=0.97, yref="paper",
+                text="not yet drift-corrected",
+                font=dict(size=10, color="rgba(255, 180, 80, 0.7)"),
+                showarrow=False,
+            )
 
     fig.update_layout(
         height=350,
@@ -477,7 +679,7 @@ if power_traces:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Download: timeline data as CSV ──────────────────────────────────
+    # ── Download: timeline data as CSV ────────────────────────────────
     csv_frames = []
     for slug, ts in power_traces.items():
         col_name = PROVIDERS[slug]["label"]
@@ -498,10 +700,11 @@ if power_traces:
         "Dashed lines = **SNAPSHOT** ground truth. "
         "Between snapshots, a proportional drift correction is applied "
         "to compensate for missed delta transitions. "
+        "The orange-shaded region after the last SNAPSHOT is raw (uncorrected). "
         "Power = SUM(nameplate-rated kW) for all in-use points."
     )
 else:
-    st.info("No power-draw data available for the selected window.")
+    st.info("No power-draw data available.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────
