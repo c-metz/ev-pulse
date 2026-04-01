@@ -8,7 +8,6 @@ Run:
 """
 from __future__ import annotations
 
-import io
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -163,6 +162,7 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         if "estimated_power_mw" not in cols:
             return empty
 
+        # Fetch ALL rows (including NULLs) so SNAPSHOT anchors aren't lost
         power_df = pd.read_sql_query(
             """
             SELECT collected_at_utc AS time,
@@ -170,7 +170,6 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
                    delivery_type
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
-              AND estimated_power_mw IS NOT NULL
             ORDER BY snapshot_id
             """,
             conn,
@@ -181,6 +180,19 @@ def load_power_and_snapshots(slug: str, hours: int = 48) -> tuple[pd.DataFrame, 
         return empty
 
     power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
+
+    # ── Fill NULL power on SNAPSHOT rows ─────────────────────────────
+    # Old SNAPSHOT rows may lack estimated_power_mw.  For each NULL
+    # SNAPSHOT, use the first non-NULL row after it (the initial DELTA
+    # after reset reflects the correct post-SNAPSHOT state).
+    snap_mask = power_df["delivery_type"] == "SNAPSHOT"
+    for idx in power_df.index[snap_mask & power_df["power_mw"].isna()]:
+        after = power_df.loc[idx + 1:, "power_mw"].dropna()
+        if not after.empty:
+            power_df.at[idx, "power_mw"] = after.iloc[0]
+
+    # Drop remaining NULL rows (non-SNAPSHOT rows missing power)
+    power_df = power_df.dropna(subset=["power_mw"]).reset_index(drop=True)
 
     # ── Proportional drift correction ────────────────────────────────
     snap_mask = power_df["delivery_type"] == "SNAPSHOT"
@@ -428,14 +440,15 @@ if power_traces:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Download: timeline as PNG ─────────────────────────────────────
-    png_bytes = fig.to_image(format="png", width=1400, height=400, scale=2)
+    # ── Download: timeline as interactive HTML ──────────────────────────
+    html_bytes = fig.to_html(include_plotlyjs="cdn").encode()
     st.download_button(
-        label="Download timeline (.png)",
-        data=png_bytes,
-        file_name=f"ev_pulse_timeline_{datetime.now(timezone.utc):%Y%m%d_%H%M}.png",
-        mime="image/png",
+        label="📥 Download timeline (.html)",
+        data=html_bytes,
+        file_name=f"ev_pulse_timeline_{datetime.now(timezone.utc):%Y%m%d_%H%M}.html",
+        mime="text/html",
     )
+    st.caption("💡 *Tip: use the 📷 icon in the chart toolbar above to save a PNG screenshot.*")
 
     st.caption(
         "Dashed lines = **SNAPSHOT** ground truth. "
