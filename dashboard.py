@@ -389,6 +389,27 @@ if map_rows:
         use_container_width=True,
         height=560,
     )
+
+    # ── Map legend ────────────────────────────────────────────────────
+    # De-duplicate colours: several statuses share the same colour, so
+    # group them into human-readable labels.
+    LEGEND_ITEMS = [
+        ("#2ecc71", "Available"),
+        ("#e74c3c", "Charging / Occupied"),
+        ("#f39c12", "Reserved"),
+        ("#e67e22", "Blocked"),
+        ("#95a5a6", "Out of service / Inoperative"),
+        ("#bdc3c7", "Unknown"),
+        ("#7f8c8d", "Removed"),
+    ]
+    legend_html = " &nbsp; ".join(
+        f'<span style="display:inline-flex;align-items:center;margin-right:6px">'
+        f'<span style="display:inline-block;width:12px;height:12px;'
+        f'border-radius:50%;background:{colour};margin-right:4px"></span>'
+        f'<span style="color:#ccc;font-size:0.82em">{label}</span></span>'
+        for colour, label in LEGEND_ITEMS
+    )
+    st.markdown(legend_html, unsafe_allow_html=True)
 else:
     st.info("No geolocation data available.")
 
