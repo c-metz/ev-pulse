@@ -56,6 +56,14 @@ def ensure_static_db(provider: Provider) -> sqlite3.Connection:
         )
     """)
     conn.executescript(provider.static_table_ddl())
+
+    # Migration: add columns that may not exist in older static databases
+    static_cols = {row[1] for row in conn.execute("PRAGMA table_info(charging_points)").fetchall()}
+    for new_col in ["evse_id"]:
+        if new_col not in static_cols:
+            LOGGER.info("Migrating charging_points: adding column '%s'", new_col)
+            conn.execute(f"ALTER TABLE charging_points ADD COLUMN {new_col} TEXT")
+
     conn.commit()
     return conn
 
@@ -134,10 +142,16 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
             ON point_status_history(snapshot_id);
     """)
 
-    # Migration: add estimated_power_mw to existing databases
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
-    if "estimated_power_mw" not in cols:
+    # Migrations: add columns that may not exist in older databases
+    sr_cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
+    if "estimated_power_mw" not in sr_cols:
         conn.execute("ALTER TABLE snapshot_runs ADD COLUMN estimated_power_mw REAL")
+
+    psh_cols = {row[1] for row in conn.execute("PRAGMA table_info(point_status_history)").fetchall()}
+    for col in provider.tracked_columns:
+        if col not in psh_cols:
+            LOGGER.info("Migrating point_status_history: adding column '%s'", col)
+            conn.execute(f"ALTER TABLE point_status_history ADD COLUMN {col} TEXT")
 
     conn.commit()
     return conn

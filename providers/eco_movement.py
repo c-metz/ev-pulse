@@ -31,7 +31,7 @@ FETCH_TIMEOUT = 180
 class EcoMovementProvider(Provider):
     name = "eco-movement"
     slug = "eco"
-    tracked_columns = ["status"]
+    tracked_columns = ["status", "price_per_kwh"]
     in_use_status = "charging"
     power_column = "point_power_w"
     power_to_mw = 1e-6
@@ -41,6 +41,7 @@ class EcoMovementProvider(Provider):
         return """
             CREATE TABLE IF NOT EXISTS charging_points (
                 point_id            TEXT PRIMARY KEY,
+                evse_id             TEXT,
                 site_id             TEXT,
                 station_id          TEXT,
                 site_name           TEXT,
@@ -126,9 +127,20 @@ class EcoMovementProvider(Provider):
                         status = ecp.get("status", {})
                         if isinstance(status, dict):
                             status = status.get("value", pd.NA)
+
+                        # ── Extract price per kWh (if available) ─────
+                        price_per_kwh = pd.NA
+                        for rate in ecp.get("energyRateUpdate", []):
+                            for ep in rate.get("energyPrice", []):
+                                pt = ep.get("priceType", {})
+                                if (isinstance(pt, dict) and
+                                        pt.get("value") == "pricePerKWh"):
+                                    price_per_kwh = ep.get("value", pd.NA)
+
                         rows.append({
                             "point_id": point_ref.get("idG", pd.NA),
                             "status": status,
+                            "price_per_kwh": price_per_kwh,
                         })
 
         return pd.DataFrame(rows).convert_dtypes(), pub_time
@@ -194,6 +206,15 @@ class EcoMovementProvider(Provider):
                         point_id = ecp.get("idG")
                         current_type = enum_val(ecp.get("currentType"))
 
+                        # ── EVSE ID (European standard identifier) ───
+                        evse_id = None
+                        for ext_id in ecp.get("externalIdentifier", []):
+                            toi = ext_id.get("typeOfIdentifier", {})
+                            if (isinstance(toi, dict) and
+                                    toi.get("extendedValueG") == "evseId"):
+                                evse_id = ext_id.get("identifier")
+                                break
+
                         avail_powers = ecp.get("availableChargingPower", [])
                         avail_power_w = None
                         if isinstance(avail_powers, list) and avail_powers:
@@ -228,6 +249,7 @@ class EcoMovementProvider(Provider):
                             "station_id": station_id,
                             "station_max_power_w": total_max_power_w,
                             "point_id": point_id,
+                            "evse_id": evse_id,
                             "current_type": current_type,
                             "available_power_w": avail_power_w,
                             "max_socket_power_w": max_socket_w,
