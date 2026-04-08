@@ -195,6 +195,118 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return timeline, snap_df
 
 
+@st.cache_data(ttl=300)
+def get_dynamic_time_range(slug: str) -> tuple[datetime, datetime] | None:
+    """Earliest and latest collected_at_utc in this provider's dynamic DB."""
+    db = DATA_DIR / f"{slug}_dynamic.sqlite"
+    if not db.exists():
+        return None
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT MIN(collected_at_utc), MAX(collected_at_utc) FROM snapshot_runs"
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return (
+        datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc),
+        datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc),
+    )
+
+
+@st.cache_data(ttl=600, max_entries=300)
+def load_state_at(slug: str, ts_iso: str) -> pd.DataFrame:
+    """Reconstruct each point's last-known status as of *ts_iso*."""
+    db = DATA_DIR / f"{slug}_dynamic.sqlite"
+    if not db.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(db) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT h.point_id, h.status
+            FROM point_status_history h
+            INNER JOIN (
+                SELECT point_id, MAX(id) AS max_id
+                FROM point_status_history
+                WHERE collected_at_utc <= ?
+                GROUP BY point_id
+            ) latest ON h.id = latest.max_id
+            """,
+            conn,
+            params=(ts_iso,),
+        )
+
+
+@st.cache_data(ttl=3600)
+def fetch_de_renewables(start_iso: str, end_iso: str) -> pd.DataFrame:
+    """Fetch German VRE generation (Solar + Wind on/offshore) from energy-charts.info.
+
+    Returns hourly DataFrame indexed by UTC time with column 'vre_mw'.
+    """
+    url = "https://api.energy-charts.info/public_power"
+    params = {"country": "de", "start": start_iso[:10], "end": end_iso[:10]}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return pd.DataFrame()
+
+    times_raw = data.get("unix_seconds") or []
+    types = data.get("production_types") or []
+    if not times_raw or not types:
+        return pd.DataFrame()
+
+    times = pd.to_datetime(times_raw, unit="s", utc=True)
+    vre_names = {"Solar", "Wind onshore", "Wind offshore"}
+    parts = {}
+    for pt in types:
+        name = pt.get("name", "")
+        if name in vre_names:
+            arr = pd.Series(pt.get("data") or [], index=times)
+            arr = pd.to_numeric(arr, errors="coerce").fillna(0.0)
+            parts[name] = arr
+    if not parts:
+        return pd.DataFrame()
+    df = pd.DataFrame(parts)
+    df["vre_mw"] = df.sum(axis=1)
+    # Resample to 1h means (energy-charts native is 15-min)
+    return df.resample("1h").mean()
+
+
+@st.cache_data(ttl=600)
+def load_eco_price_timeseries() -> pd.DataFrame:
+    """Hourly mean of observed price_per_kwh in eco-movement dynamic DB."""
+    db = DATA_DIR / "eco_dynamic.sqlite"
+    if not db.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(db) as conn:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(point_status_history)"
+        ).fetchall()}
+        if "price_per_kwh" not in cols:
+            return pd.DataFrame()
+        df = pd.read_sql_query(
+            """
+            SELECT collected_at_utc AS time, price_per_kwh
+            FROM point_status_history
+            WHERE price_per_kwh IS NOT NULL AND price_per_kwh != ''
+            """,
+            conn,
+        )
+    if df.empty:
+        return pd.DataFrame()
+    df["price_per_kwh"] = pd.to_numeric(df["price_per_kwh"], errors="coerce")
+    df = df.dropna(subset=["price_per_kwh"])
+    if df.empty:
+        return df
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return (
+        df.set_index("time")
+          .sort_index()["price_per_kwh"]
+          .resample("1h").mean()
+          .to_frame("avg_price_eur_kwh")
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  DASHBOARD
@@ -412,77 +524,322 @@ else:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DENSITY MAP  (heatmap of currently in-use chargers, bottom of page)
+#  DENSITY MAP  (time-scrubbable heatmap of in-use chargers)
 # ═══════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.markdown("#### Where charging is happening right now")
+st.markdown("#### Where charging is happening")
 
 geojson_data = load_bundeslaender()
 
-active_rows = []
-for slug in selected_providers:
-    state = all_states[slug]
-    static = all_statics[slug]
-    cfg = PROVIDERS[slug]
-    if state.empty or static.empty:
-        continue
-    in_use_mask = state["status"].eq(cfg["in_use"])
-    active = state.loc[in_use_mask].merge(
-        static[["point_id", "latitude", "longitude"]],
-        on="point_id",
-        how="inner",
-    ).dropna(subset=["latitude", "longitude"])
-    if not active.empty:
-        active_rows.append(active[["latitude", "longitude"]])
+# Find a global time range across all selected providers
+from datetime import timedelta as _td
 
-if active_rows:
-    density_df = pd.concat(active_rows, ignore_index=True)
-    density_df["weight"] = 1
+ranges = [r for r in (get_dynamic_time_range(s) for s in selected_providers) if r]
+if ranges:
+    t_min_raw = min(r[0] for r in ranges)
+    t_max_raw = max(r[1] for r in ranges)
+    t_min = t_min_raw.replace(minute=0, second=0, microsecond=0)
+    t_max = t_max_raw.replace(minute=0, second=0, microsecond=0)
+    if t_max < t_max_raw:
+        t_max = t_max + _td(hours=1)
 
-    layers = []
-    if geojson_data is not None:
+    # Hourly slider; default = "now" (latest)
+    chosen_time = st.slider(
+        "Snapshot time (UTC)",
+        min_value=t_min,
+        max_value=t_max,
+        value=t_max,
+        step=_td(hours=1),
+        format="MMM DD, HH:mm",
+    )
+    chosen_iso = chosen_time.replace(tzinfo=None).isoformat() + "+00:00"
+
+    active_rows = []
+    for slug in selected_providers:
+        static = all_statics[slug]
+        cfg = PROVIDERS[slug]
+        if static.empty:
+            continue
+        state = load_state_at(slug, chosen_iso)
+        if state.empty:
+            continue
+        active = state.loc[state["status"].eq(cfg["in_use"])].merge(
+            static[["point_id", "latitude", "longitude"]],
+            on="point_id",
+            how="inner",
+        ).dropna(subset=["latitude", "longitude"])
+        if not active.empty:
+            active_rows.append(active[["latitude", "longitude"]])
+
+    if active_rows:
+        density_df = pd.concat(active_rows, ignore_index=True)
+        density_df["weight"] = 1
+
+        layers = []
+        if geojson_data is not None:
+            layers.append(
+                pdk.Layer(
+                    "GeoJsonLayer",
+                    data=geojson_data,
+                    stroked=True,
+                    filled=False,
+                    get_line_color=[255, 255, 255, 70],
+                    line_width_min_pixels=1,
+                    pickable=False,
+                )
+            )
         layers.append(
             pdk.Layer(
-                "GeoJsonLayer",
-                data=geojson_data,
-                stroked=True,
-                filled=False,
-                get_line_color=[255, 255, 255, 70],
-                line_width_min_pixels=1,
-                pickable=False,
+                "HeatmapLayer",
+                data=density_df,
+                get_position=["longitude", "latitude"],
+                get_weight="weight",
+                radius_pixels=40,
+                intensity=1.0,
+                threshold=0.03,
+                aggregation="SUM",
             )
         )
-    layers.append(
-        pdk.Layer(
-            "HeatmapLayer",
-            data=density_df,
-            get_position=["longitude", "latitude"],
-            get_weight="weight",
-            radius_pixels=40,
-            intensity=1.0,
-            threshold=0.03,
-            aggregation="SUM",
+
+        view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.2, pitch=0)
+        st.pydeck_chart(
+            pdk.Deck(
+                layers=layers,
+                initial_view_state=view_state,
+                map_style="mapbox://styles/mapbox/dark-v11",
+            ),
+            use_container_width=True,
+            height=520,
         )
+        st.caption(
+            f"Density of **{len(density_df):,}** in-use chargers at "
+            f"**{chosen_time:%a %b %d, %H:%M UTC}** "
+            f"({', '.join(PROVIDERS[s]['label'] for s in selected_providers)}). "
+            "Drag the slider to see how the geographic load profile evolves — "
+            "compare commuter cities at 08:00 with highway corridors at 02:00."
+        )
+    else:
+        st.info("No active chargers at this timestamp.")
+else:
+    st.info("No data available.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DIURNAL × WEEKDAY LOAD SHAPE
+# ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.markdown("#### Load shape — hour of day × day of week")
+st.caption(
+    "Average MW in each (weekday, hour) bucket across the full history. "
+    "The shape a load forecaster needs in one glance: where the morning "
+    "ramp starts, where the evening peak lands, weekend vs weekday."
+)
+
+DOW_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+heatmap_cols = st.columns(max(1, len(power_traces)))
+for col, (slug, ts) in zip(heatmap_cols, power_traces.items()):
+    cfg = PROVIDERS[slug]
+    hourly = ts.resample("1h").mean()
+    if hourly.empty or hourly["power_mw"].isna().all():
+        col.info(f"{cfg['label']}: not enough data.")
+        continue
+    hourly = hourly.copy()
+    hourly["dow"] = hourly.index.dayofweek
+    hourly["hour"] = hourly.index.hour
+    pivot = hourly.pivot_table(
+        index="dow", columns="hour", values="power_mw", aggfunc="mean"
+    ).reindex(index=range(7), columns=range(24))
+
+    fig_h = go.Figure(go.Heatmap(
+        z=pivot.values,
+        x=list(range(24)),
+        y=DOW_LABELS,
+        colorscale="Viridis",
+        colorbar=dict(title="MW", thickness=10),
+        hovertemplate="%{y} %{x}:00 — %{z:.0f} MW<extra></extra>",
+    ))
+    fig_h.update_layout(
+        title=dict(text=cfg["label"], font=dict(size=13), x=0.02),
+        height=260,
+        margin=dict(l=0, r=0, t=30, b=0),
+        xaxis_title="Hour (UTC)",
+        yaxis_title="",
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    fig_h.update_xaxes(dtick=2)
+    col.plotly_chart(fig_h, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RENEWABLES CORRELATION  (EV charging MW vs Solar+Wind generation)
+# ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.markdown("#### EV charging vs German renewables (Solar + Wind)")
+st.caption(
+    "EV charging load overlaid on national VRE generation (Solar + Wind on/offshore, "
+    "via [energy-charts.info](https://energy-charts.info)). "
+    "A negative correlation would suggest charging happens *outside* of high-VRE "
+    "windows; a positive correlation hints at smart charging soaking up cheap "
+    "renewable surplus. Zero ≈ EV load is renewables-agnostic and follows pure "
+    "human routine — important framing for residual-load forecasts."
+)
+
+if power_traces:
+    t_start = min(ts.index.min() for ts in power_traces.values())
+    t_end = max(ts.index.max() for ts in power_traces.values())
+    vre_df = fetch_de_renewables(
+        pd.Timestamp(t_start).isoformat(),
+        (pd.Timestamp(t_end) + pd.Timedelta(days=1)).isoformat(),
     )
 
-    view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.2, pitch=0)
-    st.pydeck_chart(
-        pdk.Deck(
-            layers=layers,
-            initial_view_state=view_state,
-            map_style="mapbox://styles/mapbox/dark-v11",
-        ),
-        use_container_width=True,
-        height=520,
-    )
-    st.caption(
-        f"Density heatmap of **{len(density_df):,}** chargers currently in use "
-        f"({', '.join(PROVIDERS[s]['label'] for s in selected_providers)}). "
-        "Hotspots concentrate around metropolitan corridors and highway junctions."
-    )
+    if vre_df.empty:
+        st.info("Could not fetch renewables data from energy-charts.info.")
+    else:
+        # Build a unified hourly frame: each provider's MW + vre_mw
+        ev_hourly = pd.DataFrame()
+        for slug, ts in power_traces.items():
+            label = PROVIDERS[slug]["label"]
+            h = ts["power_mw"].resample("1h").mean()
+            ev_hourly[label] = h
+        ev_hourly = ev_hourly.dropna(how="all")
+
+        merged = ev_hourly.join(vre_df["vre_mw"], how="inner").dropna(how="any")
+
+        if merged.empty:
+            st.info("No overlapping time range with VRE data yet.")
+        else:
+            fig_v = go.Figure()
+            for slug in power_traces:
+                label = PROVIDERS[slug]["label"]
+                if label in merged.columns:
+                    fig_v.add_trace(go.Scatter(
+                        x=merged.index, y=merged[label],
+                        name=f"{label} (MW, left)",
+                        line=dict(width=1.4, color=PROVIDERS[slug]["color"]),
+                        yaxis="y1",
+                        hovertemplate="%{y:.0f} MW<extra>" + label + "</extra>",
+                    ))
+            fig_v.add_trace(go.Scatter(
+                x=merged.index, y=merged["vre_mw"] / 1000.0,
+                name="DE Solar + Wind (GW, right)",
+                line=dict(width=1.2, color="#2ca02c", dash="dot"),
+                yaxis="y2",
+                hovertemplate="%{y:.1f} GW<extra>VRE</extra>",
+            ))
+            fig_v.update_layout(
+                height=320,
+                margin=dict(l=0, r=0, t=10, b=0),
+                yaxis=dict(title="EV MW", rangemode="tozero",
+                           gridcolor="rgba(128,128,128,0.12)"),
+                yaxis2=dict(title="VRE (GW)", overlaying="y", side="right",
+                            rangemode="tozero", showgrid=False),
+                xaxis=dict(title="Time (UTC)",
+                           gridcolor="rgba(128,128,128,0.12)"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                hovermode="x unified",
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_v, use_container_width=True)
+
+            # Correlation block
+            metric_cols = st.columns(len(power_traces))
+            for col, slug in zip(metric_cols, power_traces):
+                label = PROVIDERS[slug]["label"]
+                if label not in merged.columns:
+                    continue
+                r = merged[[label, "vre_mw"]].corr().iloc[0, 1]
+                col.metric(
+                    f"corr({label}, VRE)",
+                    f"{r:+.2f}",
+                    help="Pearson r over hourly samples. "
+                         "Range −1 (anti-correlated) to +1 (in lockstep).",
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CONSUMER PRICE vs RENEWABLES  (eco-movement EUR/kWh)
+# ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.markdown("#### Consumer charging price vs renewables")
+st.caption(
+    "Hourly mean of all observed eco-movement EUR/kWh tariffs against German "
+    "VRE generation. Consumer charging tariffs in Germany are largely fixed by "
+    "retail contracts, so a near-zero correlation is the expected null — "
+    "any visible coupling would be a structural anomaly worth flagging."
+)
+
+price_df = load_eco_price_timeseries()
+if price_df.empty:
+    st.info("No price observations in the database yet.")
 else:
-    st.info("No active chargers to display.")
+    # Use the same vre_df from above if available; else refetch
+    try:
+        vre_df_p = vre_df  # noqa: F821
+    except NameError:
+        vre_df_p = fetch_de_renewables(
+            price_df.index.min().isoformat(),
+            (price_df.index.max() + pd.Timedelta(days=1)).isoformat(),
+        )
+
+    fig_p = go.Figure()
+    fig_p.add_trace(go.Scatter(
+        x=price_df.index,
+        y=price_df["avg_price_eur_kwh"],
+        name="Avg price (EUR/kWh)",
+        line=dict(width=1.4, color="#9467bd"),
+        yaxis="y1",
+        hovertemplate="€%{y:.3f}/kWh<extra></extra>",
+    ))
+    if isinstance(vre_df_p, pd.DataFrame) and not vre_df_p.empty:
+        fig_p.add_trace(go.Scatter(
+            x=vre_df_p.index, y=vre_df_p["vre_mw"] / 1000.0,
+            name="DE VRE (GW)",
+            line=dict(width=1.0, color="#2ca02c", dash="dot"),
+            yaxis="y2",
+            hovertemplate="%{y:.1f} GW<extra>VRE</extra>",
+        ))
+    fig_p.update_layout(
+        height=300,
+        margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(title="EUR / kWh",
+                   gridcolor="rgba(128,128,128,0.12)"),
+        yaxis2=dict(title="VRE (GW)", overlaying="y", side="right",
+                    rangemode="tozero", showgrid=False),
+        xaxis=dict(title="Time (UTC)",
+                   gridcolor="rgba(128,128,128,0.12)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        hovermode="x unified",
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_p, use_container_width=True)
+
+    # Quick stats
+    stat_cols = st.columns(3)
+    stat_cols[0].metric(
+        "Median tariff",
+        f"€{price_df['avg_price_eur_kwh'].median():.3f}/kWh",
+    )
+    stat_cols[1].metric(
+        "IQR",
+        f"€{price_df['avg_price_eur_kwh'].quantile(0.25):.3f} – "
+        f"€{price_df['avg_price_eur_kwh'].quantile(0.75):.3f}",
+    )
+    if isinstance(vre_df_p, pd.DataFrame) and not vre_df_p.empty:
+        joined = price_df.join(vre_df_p["vre_mw"], how="inner").dropna()
+        if len(joined) >= 5:
+            r_pv = joined[["avg_price_eur_kwh", "vre_mw"]].corr().iloc[0, 1]
+            stat_cols[2].metric(
+                "corr(price, VRE)", f"{r_pv:+.2f}",
+                help="Pearson r over hourly samples.",
+            )
 
 
 # ── Footer ────────────────────────────────────────────────────────────
