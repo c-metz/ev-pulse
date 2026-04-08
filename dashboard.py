@@ -686,7 +686,7 @@ st.caption(
     "A negative correlation would suggest charging happens *outside* of high-VRE "
     "windows; a positive correlation hints at smart charging soaking up cheap "
     "renewable surplus. Zero ≈ EV load is renewables-agnostic and follows pure "
-    "human routine — important framing for residual-load forecasts."
+    "human routine."
 )
 
 if power_traces:
@@ -770,9 +770,7 @@ st.divider()
 st.markdown("#### Consumer charging price vs renewables")
 st.caption(
     "Hourly mean of all observed eco-movement EUR/kWh tariffs against German "
-    "VRE generation. Consumer charging tariffs in Germany are largely fixed by "
-    "retail contracts, so a near-zero correlation is the expected null — "
-    "any visible coupling would be a structural anomaly worth flagging."
+    "VRE generation."
 )
 
 price_df = load_eco_price_timeseries()
