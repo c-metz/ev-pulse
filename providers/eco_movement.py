@@ -28,10 +28,27 @@ DYNAMIC_URL = (
 FETCH_TIMEOUT = 180
 
 
+def _parse_iso_duration_seconds(s: str) -> int:
+    """Best-effort parse of an ISO-8601 duration like 'PT1H5M30S' to seconds."""
+    import re
+    m = re.match(
+        r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$", s
+    )
+    if not m:
+        return 0
+    d, h, mi, sec = m.groups()
+    return int(
+        (int(d or 0) * 86400)
+        + (int(h or 0) * 3600)
+        + (int(mi or 0) * 60)
+        + float(sec or 0)
+    )
+
+
 class EcoMovementProvider(Provider):
     name = "eco-movement"
     slug = "eco"
-    tracked_columns = ["status", "price_per_kwh"]
+    tracked_columns = ["status", "price_per_kwh", "waiting_time_s"]
     in_use_status = "charging"
     power_column = "point_power_w"
     power_to_mw = 1e-6
@@ -57,7 +74,11 @@ class EcoMovementProvider(Provider):
                 available_power_w   REAL,
                 max_socket_power_w  REAL,
                 point_power_w       REAL,
-                connector_types     TEXT
+                connector_types     TEXT,
+                auth_methods        TEXT,
+                service_type        TEXT,
+                usage_type          TEXT,
+                num_connectors      INTEGER
             )
         """
 
@@ -137,10 +158,25 @@ class EcoMovementProvider(Provider):
                                         pt.get("value") == "pricePerKWh"):
                                     price_per_kwh = ep.get("value", pd.NA)
 
+                        # ── Extract waiting time in seconds (queue length) ──
+                        waiting_time_s = pd.NA
+                        wt = ecp.get("waitingTime")
+                        if isinstance(wt, dict):
+                            dur = wt.get("duration")
+                            if isinstance(dur, (int, float)):
+                                waiting_time_s = int(dur)
+                            elif isinstance(dur, str):
+                                # ISO-8601 duration like "PT30S" — best-effort
+                                try:
+                                    waiting_time_s = _parse_iso_duration_seconds(dur)
+                                except Exception:
+                                    waiting_time_s = pd.NA
+
                         rows.append({
                             "point_id": point_ref.get("idG", pd.NA),
                             "status": status,
                             "price_per_kwh": price_per_kwh,
+                            "waiting_time_s": waiting_time_s,
                         })
 
         return pd.DataFrame(rows).convert_dtypes(), pub_time
@@ -200,11 +236,21 @@ class EcoMovementProvider(Provider):
                 for station in site.get("energyInfrastructureStation", []):
                     station_id = station.get("idG")
                     total_max_power_w = station.get("totalMaximumPower")
+                    service_type = enum_val(station.get("serviceType"))
+
+                    auth_list = station.get("authenticationAndIdentificationMethods", [])
+                    auth_methods = ", ".join(sorted({
+                        enum_val(a) for a in auth_list if enum_val(a)
+                    })) or None
 
                     for rp in station.get("refillPoint", []):
                         ecp = rp.get("aegiElectricChargingPoint", {})
                         point_id = ecp.get("idG")
                         current_type = enum_val(ecp.get("currentType"))
+                        num_connectors = ecp.get("numberOfConnectors")
+                        usage_type = ", ".join(sorted({
+                            enum_val(u) for u in ecp.get("usageType", []) if enum_val(u)
+                        })) or None
 
                         # ── EVSE ID (European standard identifier) ───
                         evse_id = None
@@ -255,6 +301,10 @@ class EcoMovementProvider(Provider):
                             "max_socket_power_w": max_socket_w,
                             "point_power_w": point_power_w,
                             "connector_types": ", ".join(sorted(set(connector_types))) or None,
+                            "auth_methods": auth_methods,
+                            "service_type": service_type,
+                            "usage_type": usage_type,
+                            "num_connectors": num_connectors,
                         })
 
         df = pd.DataFrame(rows)

@@ -12,7 +12,6 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
@@ -47,29 +46,10 @@ PROVIDERS = {
     },
 }
 
-STATUS_COLORS = {
-    "available": "#2ecc71",
-    "charging": "#e74c3c",
-    "occupied": "#e74c3c",
-    "outOfService": "#95a5a6",
-    "outOfOrder": "#95a5a6",
-    "unknown": "#bdc3c7",
-    "removed": "#7f8c8d",
-    "reserved": "#f39c12",
-    "inoperative": "#95a5a6",
-    "blocked": "#e67e22",
-}
-DEFAULT_COLOR = "#bdc3c7"
-
 BUNDESLAENDER_GEOJSON_URL = (
     "https://raw.githubusercontent.com/isellsoap/deutschlandGeoJSON"
     "/main/2_bundeslaender/4_niedrig.geo.json"
 )
-
-
-def hex_to_rgba(hex_str: str, alpha: int = 180) -> list[int]:
-    h = hex_str.lstrip("#")
-    return [int(h[i : i + 2], 16) for i in (0, 2, 4)] + [alpha]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -220,10 +200,35 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 #  DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════
 
+# ── Mobile-friendly CSS ───────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+      /* Tighten default page padding so plots breathe on phones */
+      .block-container {
+          padding-top: 1rem;
+          padding-bottom: 1rem;
+          padding-left: 0.6rem;
+          padding-right: 0.6rem;
+          max-width: 100% !important;
+      }
+      /* Smaller H1 on small screens */
+      @media (max-width: 640px) {
+          h1 { font-size: 1.4rem !important; }
+          .block-container { padding-left: 0.3rem; padding-right: 0.3rem; }
+          [data-testid="stPlotlyChart"] { min-height: 260px; }
+      }
+      /* Make pydeck and plotly fill the column on phones */
+      [data-testid="stDeckGlJsonChart"] > div { width: 100% !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ── Header ────────────────────────────────────────────────────────────
 st.markdown(
     "<h1 style='margin-bottom:0'>EV Pulse &mdash; Germany</h1>"
-    "<p style='color:gray;margin-top:0;font-size:0.95em'>"
+    "<p style='color:gray;margin-top:0;font-size:0.9em'>"
     "Real-time EV charging infrastructure &ensp;|&ensp;"
     "AFIR / DATEX II via "
     "<a href='https://mobilithek.info' style='color:gray'>Mobilithek</a>"
@@ -292,111 +297,8 @@ for slug in selected_providers:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LIVE MAP  (current state, with Bundesland borders)
+#  POWER DRAW TIMELINE  (top of page — drift-corrected, ALL data)
 # ═══════════════════════════════════════════════════════════════════════
-
-LEGEND_ITEMS = [
-    ("#2ecc71", "Available"),
-    ("#e74c3c", "Charging / Occupied"),
-    ("#f39c12", "Reserved"),
-    ("#e67e22", "Blocked"),
-    ("#95a5a6", "Out of service / Inoperative"),
-    ("#bdc3c7", "Unknown"),
-    ("#7f8c8d", "Removed"),
-]
-
-# ── Helper: build pydeck layers from a DataFrame ─────────────────────
-geojson_data = load_bundeslaender()
-
-
-def _build_map_layers(df: pd.DataFrame) -> list:
-    """Return pydeck layers for a map DataFrame with color_rgba column."""
-    layers = []
-    if geojson_data is not None:
-        layers.append(
-            pdk.Layer(
-                "GeoJsonLayer",
-                data=geojson_data,
-                stroked=True,
-                filled=False,
-                get_line_color=[255, 255, 255, 70],
-                line_width_min_pixels=1,
-                pickable=False,
-            )
-        )
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position=["longitude", "latitude"],
-            get_fill_color="color_rgba",
-            get_radius=800,
-            pickable=True,
-            opacity=0.7,
-            radius_min_pixels=2,
-            radius_max_pixels=8,
-        )
-    )
-    return layers
-
-
-map_rows = []
-for slug in selected_providers:
-    state = all_states[slug]
-    static = all_statics[slug]
-    cfg = PROVIDERS[slug]
-    if state.empty or static.empty:
-        continue
-    merged = state.merge(
-        static[["point_id", "latitude", "longitude"]],
-        on="point_id",
-        how="inner",
-    )
-    merged = merged.dropna(subset=["latitude", "longitude"])
-    merged["provider"] = cfg["label"]
-    merged["color_rgba"] = merged["status"].map(
-        lambda s: hex_to_rgba(STATUS_COLORS.get(s, DEFAULT_COLOR))
-    )
-    map_rows.append(merged)
-
-if map_rows:
-    map_df = pd.concat(map_rows, ignore_index=True)
-    view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.5, pitch=0)
-
-    st.pydeck_chart(
-        pdk.Deck(
-            layers=_build_map_layers(
-                map_df[["latitude", "longitude", "status", "provider", "color_rgba", "point_id"]]
-            ),
-            initial_view_state=view_state,
-            map_style="mapbox://styles/mapbox/dark-v11",
-            tooltip={
-                "html": "<b>{provider}</b><br/>ID: {point_id}<br/>Status: {status}",
-                "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
-            },
-        ),
-        use_container_width=True,
-        height=560,
-    )
-
-    legend_html = " &nbsp; ".join(
-        f'<span style="display:inline-flex;align-items:center;margin-right:6px">'
-        f'<span style="display:inline-block;width:12px;height:12px;'
-        f'border-radius:50%;background:{colour};margin-right:4px"></span>'
-        f'<span style="color:#ccc;font-size:0.82em">{label}</span></span>'
-        for colour, label in LEGEND_ITEMS
-    )
-    st.markdown(legend_html, unsafe_allow_html=True)
-else:
-    st.info("No geolocation data available.")
-
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  POWER DRAW TIMELINE  (per-provider lines, drift-corrected, ALL data)
-# ═══════════════════════════════════════════════════════════════════════
-
-st.divider()
 
 power_traces: dict[str, pd.DataFrame] = {}
 snapshot_markers: dict[str, pd.DataFrame] = {}
@@ -507,6 +409,80 @@ if power_traces:
     )
 else:
     st.info("No power-draw data available.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DENSITY MAP  (heatmap of currently in-use chargers, bottom of page)
+# ═══════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.markdown("#### Where charging is happening right now")
+
+geojson_data = load_bundeslaender()
+
+active_rows = []
+for slug in selected_providers:
+    state = all_states[slug]
+    static = all_statics[slug]
+    cfg = PROVIDERS[slug]
+    if state.empty or static.empty:
+        continue
+    in_use_mask = state["status"].eq(cfg["in_use"])
+    active = state.loc[in_use_mask].merge(
+        static[["point_id", "latitude", "longitude"]],
+        on="point_id",
+        how="inner",
+    ).dropna(subset=["latitude", "longitude"])
+    if not active.empty:
+        active_rows.append(active[["latitude", "longitude"]])
+
+if active_rows:
+    density_df = pd.concat(active_rows, ignore_index=True)
+    density_df["weight"] = 1
+
+    layers = []
+    if geojson_data is not None:
+        layers.append(
+            pdk.Layer(
+                "GeoJsonLayer",
+                data=geojson_data,
+                stroked=True,
+                filled=False,
+                get_line_color=[255, 255, 255, 70],
+                line_width_min_pixels=1,
+                pickable=False,
+            )
+        )
+    layers.append(
+        pdk.Layer(
+            "HeatmapLayer",
+            data=density_df,
+            get_position=["longitude", "latitude"],
+            get_weight="weight",
+            radius_pixels=40,
+            intensity=1.0,
+            threshold=0.03,
+            aggregation="SUM",
+        )
+    )
+
+    view_state = pdk.ViewState(latitude=51.1, longitude=10.4, zoom=5.2, pitch=0)
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=layers,
+            initial_view_state=view_state,
+            map_style="mapbox://styles/mapbox/dark-v11",
+        ),
+        use_container_width=True,
+        height=520,
+    )
+    st.caption(
+        f"Density heatmap of **{len(density_df):,}** chargers currently in use "
+        f"({', '.join(PROVIDERS[s]['label'] for s in selected_providers)}). "
+        "Hotspots concentrate around metropolitan corridors and highway junctions."
+    )
+else:
+    st.info("No active chargers to display.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────

@@ -59,10 +59,17 @@ def ensure_static_db(provider: Provider) -> sqlite3.Connection:
 
     # Migration: add columns that may not exist in older static databases
     static_cols = {row[1] for row in conn.execute("PRAGMA table_info(charging_points)").fetchall()}
-    for new_col in ["evse_id"]:
+    new_static_cols = {
+        "evse_id": "TEXT",
+        "auth_methods": "TEXT",
+        "service_type": "TEXT",
+        "usage_type": "TEXT",
+        "num_connectors": "INTEGER",
+    }
+    for new_col, col_type in new_static_cols.items():
         if new_col not in static_cols:
             LOGGER.info("Migrating charging_points: adding column '%s'", new_col)
-            conn.execute(f"ALTER TABLE charging_points ADD COLUMN {new_col} TEXT")
+            conn.execute(f"ALTER TABLE charging_points ADD COLUMN {new_col} {col_type}")
 
     conn.commit()
     return conn
