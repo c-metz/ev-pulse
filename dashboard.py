@@ -655,11 +655,12 @@ else:
 # ═══════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.markdown("#### Installed station capacity distribution")
+st.markdown("#### Installed site capacity distribution")
 st.caption(
-    "Histogram of station-level maximum power ratings (kW) across all "
-    "registered charging stations. The distribution reveals the AC / DC "
-    "split and helps calibrate power-draw estimates."
+    "Histogram of total nameplate capacity (kW) per charging *site* "
+    "(= sum of all connector ratings at one location). "
+    "Small sites (≤ 22 kW) are typically single AC wallboxes; "
+    "large sites are highway Ladeparks or depot hubs with dozens of DC stalls."
 )
 
 power_hist_data = {}
@@ -695,8 +696,8 @@ if power_hist_data:
         height=320,
         margin=dict(l=0, r=0, t=10, b=0),
         barmode="overlay",
-        xaxis_title="Station max power (kW)",
-        yaxis_title="Number of stations",
+        xaxis_title="Site total nameplate capacity (kW)",
+        yaxis_title="Number of sites",
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         hovermode="x unified",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -713,9 +714,9 @@ if power_hist_data:
         ac_count = (vals <= 22).sum()
         dc_count = (vals > 22).sum()
         col.metric(
-            f"{cfg['label']} — median",
+            f"{cfg['label']} — median site",
             f"{vals.median():.0f} kW",
-            help=f"AC (≤22 kW): {ac_count:,} stations | DC (>22 kW): {dc_count:,} stations | "
+            help=f"AC-only sites (≤22 kW): {ac_count:,} | Sites with DC (>22 kW): {dc_count:,} | "
                  f"P95: {vals.quantile(0.95):.0f} kW | Max: {vals.max():.0f} kW",
         )
 else:
