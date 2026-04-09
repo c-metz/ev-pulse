@@ -432,25 +432,56 @@ for slug in selected_providers:
 if power_traces:
     fig = go.Figure()
 
+    # ── Per-provider traces: solid where corrected, dashed where not ──
+    snap_times = set()
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
         resampled = ts.resample("1min").last().ffill()
-        fig.add_trace(go.Scatter(
-            x=resampled.index,
-            y=resampled["power_mw"],
-            name=cfg["label"],
-            mode="lines",
-            line=dict(width=1.2, color=cfg["color"]),
-            hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
-        ))
+
+        snaps = snapshot_markers.get(slug)
+        last_snap_ts = (
+            pd.Timestamp(snaps["time"].max()) if snaps is not None and not snaps.empty
+            else None
+        )
+
+        if last_snap_ts is not None and last_snap_ts < resampled.index.max():
+            # Split at the provider's own last SNAPSHOT
+            corrected = resampled.loc[:last_snap_ts]
+            uncorrected = resampled.loc[last_snap_ts:]  # overlap at boundary for continuity
+
+            if not corrected.empty:
+                fig.add_trace(go.Scatter(
+                    x=corrected.index, y=corrected["power_mw"],
+                    name=cfg["label"], legendgroup=cfg["label"],
+                    mode="lines",
+                    line=dict(width=1.2, color=cfg["color"]),
+                    hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
+                ))
+            if len(uncorrected) > 1:
+                fig.add_trace(go.Scatter(
+                    x=uncorrected.index, y=uncorrected["power_mw"],
+                    name=cfg["label"] + " (uncorrected)",
+                    legendgroup=cfg["label"], showlegend=False,
+                    mode="lines",
+                    line=dict(width=1.2, color=cfg["color"], dash="dash"),
+                    hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + " (uncorrected)</extra>",
+                ))
+        else:
+            # No split possible — entire trace is uncorrected (or brand new)
+            is_uncorrected = last_snap_ts is None and len(resampled) > 1
+            fig.add_trace(go.Scatter(
+                x=resampled.index, y=resampled["power_mw"],
+                name=cfg["label"],
+                mode="lines",
+                line=dict(width=1.2, color=cfg["color"],
+                          dash="dash" if is_uncorrected else "solid"),
+                hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
+            ))
 
     # ── SNAPSHOT markers ──────────────────────────────────────────────
-    snap_times = set()
     for snaps in snapshot_markers.values():
         for t in snaps["time"]:
             snap_times.add(t)
-
-    last_snap_time = max(snap_times) if snap_times else None
 
     for snap_t in sorted(snap_times):
         x_val = pd.Timestamp(snap_t).to_pydatetime()
@@ -466,27 +497,21 @@ if power_traces:
             showarrow=False, yanchor="bottom",
         )
 
-    # ── Shaded uncorrected region after last SNAPSHOT ─────────────────
-    if last_snap_time is not None:
-        x_end = max(ts.index.max() for ts in power_traces.values())
-        last_snap_dt = pd.Timestamp(last_snap_time).to_pydatetime()
-        x_end_dt = pd.Timestamp(x_end).to_pydatetime()
-        if x_end_dt > last_snap_dt:
-            fig.add_shape(
-                type="rect",
-                x0=last_snap_dt, x1=x_end_dt,
-                y0=0, y1=1, yref="paper",
-                fillcolor="rgba(255, 165, 0, 0.07)",
-                line=dict(width=0),
-                layer="below",
-            )
-            mid_x = last_snap_dt + (x_end_dt - last_snap_dt) / 2
+    # ── "Not yet drift-corrected" annotation at the transition ────────
+    for slug in power_traces:
+        snaps = snapshot_markers.get(slug)
+        if snaps is None or snaps.empty:
+            continue
+        last_snap_dt = pd.Timestamp(snaps["time"].max()).to_pydatetime()
+        ts_end = power_traces[slug].index.max()
+        if pd.Timestamp(ts_end).to_pydatetime() > last_snap_dt:
             fig.add_annotation(
-                x=mid_x, y=0.97, yref="paper",
-                text="not yet drift-corrected",
-                font=dict(size=10, color="rgba(255, 180, 80, 0.7)"),
-                showarrow=False,
+                x=last_snap_dt, y=0.97, yref="paper",
+                text="not yet drift-corrected  \u27A1",
+                font=dict(size=9, color="rgba(255, 180, 80, 0.7)"),
+                showarrow=False, xanchor="left",
             )
+            break  # one annotation is enough
 
     fig.update_layout(
         height=350,
