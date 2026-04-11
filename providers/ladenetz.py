@@ -182,6 +182,39 @@ class LadenetzProvider(Provider):
 
         return pd.DataFrame(rows).convert_dtypes(), pub_time
 
+    def parse_static_points(self, data) -> tuple[pd.DataFrame, pd.Timestamp]:
+        """Parse pre-fetched static XML into (points_df, pub_time).
+
+        Used by the push receiver when the payload is already available.
+        """
+        if isinstance(data, bytes):
+            root = ET.fromstring(data)
+        elif isinstance(data, ET.Element):
+            root = data
+        else:
+            raise TypeError(f"Expected bytes or Element, got {type(data)}")
+
+        rows = self._parse_static_xml(root)
+        points_df = pd.DataFrame(rows)
+        for c in ["latitude", "longitude", "available_power_w",
+                   "max_socket_power_w", "point_power_w"]:
+            if c in points_df.columns:
+                points_df[c] = pd.to_numeric(points_df[c], errors="coerce")
+        points_df = points_df.convert_dtypes()
+
+        pub_time_el = root.find(".//ei:publicationTime", NS)
+        if pub_time_el is None:
+            pub_time_el = root.find(
+                ".//{http://datex2.eu/schema/3/energyInfrastructure}publicationTime"
+            )
+        pub_time_str = pub_time_el.text if pub_time_el is not None else None
+        pub_time = (
+            pd.to_datetime(pub_time_str, utc=True)
+            if pub_time_str
+            else pd.Timestamp.now("UTC")
+        )
+        return points_df, pub_time
+
     # ── Private helpers ───────────────────────────────────────────────
     def _parse_static_xml(self, root: ET.Element) -> list[dict]:
         rows: list[dict] = []
