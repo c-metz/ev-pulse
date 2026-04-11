@@ -183,13 +183,13 @@ async def receive_push(subscription_id: str, request: Request):
     try:
         data = _parse_body(body)
     except Exception:
-        # Mobilithek sends non-DATEX II test payloads when testing the
-        # connection — accept them with 200 so the test passes.
+        # Log the raw payload for debugging, then accept gracefully.
         LOGGER.warning(
-            "Unparseable payload for %s/%s (%d bytes) — likely a connection test, accepting.",
+            "Unparseable payload for %s/%s (%d bytes), first 500 chars: %s",
             prov_name, feed_type, len(body),
+            body[:500].decode("utf-8", errors="replace"),
         )
-        return Response(status_code=200, content="OK (test accepted)")
+        return Response(status_code=200, content="OK (accepted)")
 
     try:
         if feed_type == "static":
