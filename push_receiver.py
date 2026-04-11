@@ -45,6 +45,7 @@ SUBSCRIPTION_MAP: dict[str, tuple[str, str]] = {
     "970702152460550144": ("eco_movement", "static"),
     "970702182768590848": ("eco_movement", "dynamic"),
     # tesla
+    "970702233322381312": ("tesla", "static"),
     "970702208026705920": ("tesla", "dynamic"),
     # ladenetz
     "970702370149138432": ("ladenetz", "static"),
@@ -52,7 +53,9 @@ SUBSCRIPTION_MAP: dict[str, tuple[str, str]] = {
 }
 
 # ── Providers whose static data must be pulled (no push subscription) ─
-STATIC_PULL_PROVIDERS = ["tesla"]
+# Tesla static now has a push subscription, so this list is empty.
+# Keep the mechanism in case future providers lack a push static feed.
+STATIC_PULL_PROVIDERS: list[str] = []
 STATIC_PULL_INTERVAL = timedelta(hours=12)
 
 # ── Per-provider state (DB connections + last known dynamic state) ────
@@ -64,12 +67,22 @@ _previous_states: dict[str, pd.DataFrame | None] = {}
 _static_pull_stop = threading.Event()
 
 
+def _open_db(path) -> sqlite3.Connection:
+    """Open a SQLite connection safe for use across threads."""
+    return sqlite3.connect(path, check_same_thread=False)
+
+
 def _init_provider(name: str) -> None:
     """Initialise DB connections and load last-known state for a provider."""
     provider = get_provider(name)
     _providers[name] = provider
-    _static_conns[name] = col.ensure_static_db(provider)
-    _dynamic_conns[name] = col.ensure_dynamic_db(provider)
+
+    # Ensure schema, then reopen with check_same_thread=False
+    col.ensure_static_db(provider).close()
+    col.ensure_dynamic_db(provider).close()
+    _static_conns[name] = _open_db(provider.static_db_path)
+    _dynamic_conns[name] = _open_db(provider.dynamic_db_path)
+
     _previous_states[name] = col.load_last_known_state(
         _dynamic_conns[name], provider,
     )
@@ -155,6 +168,14 @@ async def health():
             for name, st in _previous_states.items()
         },
     }
+
+
+@app.head("/push/{subscription_id}")
+async def head_push(subscription_id: str):
+    """Mobilithek sends HEAD to verify the endpoint is reachable."""
+    if subscription_id in SUBSCRIPTION_MAP:
+        return Response(status_code=200)
+    return Response(status_code=404)
 
 
 @app.post("/push/{subscription_id}")
