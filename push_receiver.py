@@ -48,6 +48,9 @@ SUBSCRIPTION_MAP: dict[str, tuple[str, str]] = {
     # tesla
     "970702233322381312": ("tesla", "static"),
     "970702208026705920": ("tesla", "dynamic"),
+    # enbw
+    "970702332500893696": ("enbw", "static"),
+    "970702311915421696": ("enbw", "dynamic"),
     # ladenetz
     "970702370149138432": ("ladenetz", "static"),
     "970702352017145856": ("ladenetz", "dynamic"),

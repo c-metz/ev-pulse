@@ -18,6 +18,7 @@ from __future__ import annotations
 from providers.base import Provider
 from providers.tesla import TeslaProvider
 from providers.eco_movement import EcoMovementProvider
+from providers.enbw import EnbwProvider
 from providers.eliso import ElisoProvider
 from providers.ladenetz import LadenetzProvider
 from providers.msu import MsuProvider
@@ -26,6 +27,7 @@ from providers.wirelane import WirelaneProvider
 PROVIDERS: dict[str, type[Provider]] = {
     "tesla": TeslaProvider,
     "eco_movement": EcoMovementProvider,
+    "enbw": EnbwProvider,
     "eliso": ElisoProvider,
     "ladenetz": LadenetzProvider,
     "msu": MsuProvider,
