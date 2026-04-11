@@ -129,11 +129,22 @@ async def receive_push(subscription_id: str, request: Request):
     )
 
     try:
+        data = _parse_body(body)
+    except Exception:
+        # Mobilithek sends non-DATEX II test payloads when testing the
+        # connection — accept them with 200 so the test passes.
+        LOGGER.warning(
+            "Unparseable payload for %s/%s (%d bytes) — likely a connection test, accepting.",
+            prov_name, feed_type, len(body),
+        )
+        return Response(status_code=200, content="OK (test accepted)")
+
+    try:
         if feed_type == "static":
-            _handle_static_push(prov_name, provider, body)
+            _handle_static_push(prov_name, provider, data)
         else:
             _handle_dynamic_push(
-                prov_name, provider, body, delivery_type, last_modified,
+                prov_name, provider, data, delivery_type, last_modified,
             )
     except Exception:
         LOGGER.exception("Error processing push for %s/%s", prov_name, feed_type)
@@ -153,10 +164,8 @@ def _parse_body(body: bytes):
 
 
 def _handle_static_push(
-    prov_name: str, provider: Provider, body: bytes,
+    prov_name: str, provider: Provider, data,
 ) -> None:
-    data = _parse_body(body)
-
     if hasattr(provider, "parse_static_points"):
         # XML providers (ladenetz): dedicated method for pre-fetched data
         points_df, pub_time = provider.parse_static_points(data)
@@ -182,11 +191,10 @@ def _handle_static_push(
 def _handle_dynamic_push(
     prov_name: str,
     provider: Provider,
-    body: bytes,
+    data,
     delivery_type: str,
     last_modified: str | None,
 ) -> None:
-    data = _parse_body(body)
     status_df, pub_time = provider.parse_dynamic_points(data)
 
     if status_df.empty:
