@@ -15,6 +15,7 @@ In production, nginx terminates TLS and reverse-proxies to this.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import sqlite3
@@ -229,11 +230,18 @@ async def receive_push(subscription_id: str, request: Request):
 # ── Static push handling ─────────────────────────────────────────────
 
 def _parse_body(body: bytes):
-    """Auto-detect JSON vs XML and return parsed object."""
+    """Auto-detect gzip / JSON / XML and return parsed object."""
+    # Decompress gzip if needed (Mobilithek may compress push payloads)
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+
     stripped = body.lstrip()
     if stripped[:1] in (b"{", b"["):
         return json.loads(body)
-    return ET.fromstring(body)
+    if stripped[:1] == b"<":
+        return ET.fromstring(body)
+
+    raise ValueError(f"Unknown format (first bytes: {body[:20]!r})")
 
 
 def _handle_static_push(
