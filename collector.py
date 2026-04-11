@@ -232,12 +232,24 @@ def store_dynamic_snapshot(
     delivery_type: str,
     previous_state: pd.DataFrame | None,
     static_conn: sqlite3.Connection | None = None,
-) -> tuple[int, pd.DataFrame]:
+) -> tuple[int | None, pd.DataFrame]:
     collected_at = datetime.now(timezone.utc).isoformat()
     tracked = provider.tracked_columns
 
     # ── Step 1: Compute the full updated state ───────────────────────
     changed_df = find_changed_rows(status_df, previous_state, tracked)
+
+    # Skip no-op DELTA deliveries: nothing changed, nothing to record.
+    # SNAPSHOTs are never skipped — they confirm/reset ground truth.
+    if (changed_df.empty
+            and delivery_type != "SNAPSHOT"
+            and previous_state is not None
+            and not previous_state.empty):
+        LOGGER.debug(
+            "No-op %s for %s — 0 changes, skipping snapshot_run.",
+            delivery_type, provider.name,
+        )
+        return None, previous_state
 
     if previous_state is not None and not previous_state.empty:
         updated = previous_state.copy()
