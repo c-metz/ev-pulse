@@ -19,8 +19,10 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from fastapi import FastAPI, Request, Response
@@ -49,12 +51,17 @@ SUBSCRIPTION_MAP: dict[str, tuple[str, str]] = {
     "970702352017145856": ("ladenetz", "dynamic"),
 }
 
+# ── Providers whose static data must be pulled (no push subscription) ─
+STATIC_PULL_PROVIDERS = ["tesla"]
+STATIC_PULL_INTERVAL = timedelta(hours=12)
+
 # ── Per-provider state (DB connections + last known dynamic state) ────
 _lock = threading.Lock()
 _providers: dict[str, Provider] = {}
 _static_conns: dict[str, sqlite3.Connection] = {}
 _dynamic_conns: dict[str, sqlite3.Connection] = {}
 _previous_states: dict[str, pd.DataFrame | None] = {}
+_static_pull_stop = threading.Event()
 
 
 def _init_provider(name: str) -> None:
@@ -70,6 +77,36 @@ def _init_provider(name: str) -> None:
     LOGGER.info("%s: initialised (%d known point states)", provider.name, n)
 
 
+def _static_pull_loop() -> None:
+    """Background thread: periodically pull static data for providers
+    that don't have a push subscription for their static feed
+    (e.g. Tesla, whose static endpoint is public/noauth)."""
+    last_refresh: dict[str, datetime] = {}
+    while not _static_pull_stop.is_set():
+        now = datetime.now(timezone.utc)
+        for name in STATIC_PULL_PROVIDERS:
+            if name not in _providers:
+                continue
+            last = last_refresh.get(name)
+            if last and now - last < STATIC_PULL_INTERVAL:
+                continue
+            provider = _providers[name]
+            try:
+                LOGGER.info("Pulling static data for %s …", provider.name)
+                points_df, pub_time = provider.load_static_snapshot()
+                with _lock:
+                    col.store_static_snapshot(
+                        _static_conns[name], points_df, pub_time,
+                    )
+                last_refresh[name] = now
+            except Exception:
+                LOGGER.exception(
+                    "Failed to pull static data for %s", provider.name,
+                )
+                last_refresh[name] = now  # back off, retry next interval
+        _static_pull_stop.wait(timeout=300)  # check every 5 min
+
+
 # ── FastAPI lifecycle ────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -78,11 +115,26 @@ async def lifespan(app: FastAPI):
         if prov_name not in seen:
             _init_provider(prov_name)
             seen.add(prov_name)
+    # Also init providers that only need static pulls
+    for name in STATIC_PULL_PROVIDERS:
+        if name not in seen:
+            _init_provider(name)
+            seen.add(name)
+
+    # Start background static puller
+    pull_thread = threading.Thread(
+        target=_static_pull_loop, daemon=True, name="static-puller",
+    )
+    pull_thread.start()
+
     LOGGER.info(
-        "Push receiver ready — %d providers, %d subscriptions",
-        len(seen), len(SUBSCRIPTION_MAP),
+        "Push receiver ready — %d providers, %d push subscriptions, "
+        "%d static-pull providers",
+        len(seen), len(SUBSCRIPTION_MAP), len(STATIC_PULL_PROVIDERS),
     )
     yield
+    _static_pull_stop.set()
+    pull_thread.join(timeout=10)
     for conn in _static_conns.values():
         conn.close()
     for conn in _dynamic_conns.values():
