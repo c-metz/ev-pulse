@@ -44,6 +44,22 @@ PROVIDERS = {
         "to_mw": 1e-3,
         "color": "#d62728",
     },
+    "enbw": {
+        "label": "EnBW",
+        "in_use": "charging",
+        "in_use_col": "charging_count",
+        "power_col": "point_power_w",
+        "to_mw": 1e-6,
+        "color": "#ff7f0e",
+    },
+    "ladenetz": {
+        "label": "ladenetz",
+        "in_use": "charging",
+        "in_use_col": "charging_count",
+        "power_col": "point_power_w",
+        "to_mw": 1e-6,
+        "color": "#17becf",
+    },
 }
 
 BUNDESLAENDER_GEOJSON_URL = (
@@ -519,6 +535,13 @@ if power_traces:
     fig.update_yaxes(gridcolor="rgba(128,128,128,0.12)", rangemode="tozero")
 
     st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "⚠️ **Explanatory note:** on 11 Apr 2025, data collection was switched "
+        "from pull to push delivery. This introduced signal oscillation in "
+        "eco-movement data, currently under investigation. "
+        "See [GitHub](https://github.com/c-metz/ev-pulse) for status."
+    )
 
     # ── Download: timeline data as CSV ────────────────────────────────
     csv_frames = []
