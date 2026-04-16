@@ -65,11 +65,20 @@ def ensure_static_db(provider: Provider) -> sqlite3.Connection:
         "service_type": "TEXT",
         "usage_type": "TEXT",
         "num_connectors": "INTEGER",
+        # History tracking: when was this batch fetched?
+        # Existing rows (before this migration) get the epoch timestamp so
+        # they sort before any real fetch and load_static still works.
+        "fetched_at_utc": "TEXT DEFAULT '1970-01-01T00:00:00+00:00'",
     }
     for new_col, col_type in new_static_cols.items():
         if new_col not in static_cols:
             LOGGER.info("Migrating charging_points: adding column '%s'", new_col)
             conn.execute(f"ALTER TABLE charging_points ADD COLUMN {new_col} {col_type}")
+
+    # Index to make "latest batch" queries fast
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cp_fetched ON charging_points(fetched_at_utc)"
+    )
 
     conn.commit()
     return conn
@@ -81,7 +90,10 @@ def store_static_snapshot(
     publication_time: pd.Timestamp,
 ) -> None:
     deduped = points_df.drop_duplicates(subset=["point_id"], keep="last")
-    conn.execute("DELETE FROM charging_points")
+    # Stamp each row with the current fetch time so history is preserved.
+    # We never DELETE — old versions remain queryable by fetched_at_utc.
+    deduped = deduped.copy()
+    deduped["fetched_at_utc"] = datetime.now(timezone.utc).isoformat()
     deduped.to_sql("charging_points", conn, if_exists="append", index=False)
     conn.execute(
         "INSERT OR REPLACE INTO static_meta (key, value) VALUES (?, ?)",

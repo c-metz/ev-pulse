@@ -87,15 +87,19 @@ def load_current_state(slug: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
+        # Use MAX(collected_at_utc) GROUP BY point_id — resolved by the
+        # existing idx_psh_point_time(point_id, collected_at_utc) index,
+        # which is O(n_unique_points) not O(all_rows).
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status, h.collected_at_utc
             FROM point_status_history h
             INNER JOIN (
-                SELECT point_id, MAX(id) AS max_id
+                SELECT point_id, MAX(collected_at_utc) AS max_time
                 FROM point_status_history
                 GROUP BY point_id
-            ) latest ON h.id = latest.max_id
+            ) latest ON h.point_id = latest.point_id
+                    AND h.collected_at_utc = latest.max_time
             """,
             conn,
         )
@@ -107,6 +111,17 @@ def load_static(slug: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(charging_points)").fetchall()}
+        if "fetched_at_utc" in cols:
+            # Return only the latest fetch batch; older batches are preserved
+            # in the DB for history but not loaded into the dashboard.
+            return pd.read_sql_query(
+                """
+                SELECT * FROM charging_points
+                WHERE fetched_at_utc = (SELECT MAX(fetched_at_utc) FROM charging_points)
+                """,
+                conn,
+            )
         return pd.read_sql_query("SELECT * FROM charging_points", conn)
 
 
@@ -141,7 +156,7 @@ def load_snapshot_meta(slug: str) -> dict:
 
 @st.cache_data(ttl=60)
 def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the full MW timeline with drift correction, plus SNAPSHOT timestamps."""
+    """Load the MW timeline (last 8 days) with drift correction, plus SNAPSHOT timestamps."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
     if not db.exists():
@@ -158,6 +173,7 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                    estimated_power_mw AS power_mw,
                    delivery_type
             FROM snapshot_runs
+            WHERE collected_at_utc >= datetime('now', '-8 days')
             ORDER BY snapshot_id
             """,
             conn,
@@ -213,13 +229,15 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 @st.cache_data(ttl=300)
 def get_dynamic_time_range(slug: str) -> tuple[datetime, datetime] | None:
-    """Earliest and latest collected_at_utc in this provider's dynamic DB."""
+    """Earliest and latest collected_at_utc in the last 8 days of data."""
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     if not db.exists():
         return None
     with sqlite3.connect(db) as conn:
         row = conn.execute(
-            "SELECT MIN(collected_at_utc), MAX(collected_at_utc) FROM snapshot_runs"
+            """SELECT MIN(collected_at_utc), MAX(collected_at_utc)
+               FROM snapshot_runs
+               WHERE collected_at_utc >= datetime('now', '-8 days')"""
         ).fetchone()
     if not row or not row[0]:
         return None
@@ -236,16 +254,19 @@ def load_state_at(slug: str, ts_iso: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
+        # MAX(collected_at_utc) with WHERE collected_at_utc <= ? uses
+        # idx_psh_point_time(point_id, collected_at_utc) efficiently.
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status
             FROM point_status_history h
             INNER JOIN (
-                SELECT point_id, MAX(id) AS max_id
+                SELECT point_id, MAX(collected_at_utc) AS max_time
                 FROM point_status_history
                 WHERE collected_at_utc <= ?
                 GROUP BY point_id
-            ) latest ON h.id = latest.max_id
+            ) latest ON h.point_id = latest.point_id
+                    AND h.collected_at_utc = latest.max_time
             """,
             conn,
             params=(ts_iso,),
@@ -306,6 +327,7 @@ def load_eco_price_timeseries() -> pd.DataFrame:
             SELECT collected_at_utc AS time, price_per_kwh
             FROM point_status_history
             WHERE price_per_kwh IS NOT NULL AND price_per_kwh != ''
+              AND collected_at_utc >= datetime('now', '-8 days')
             """,
             conn,
         )
