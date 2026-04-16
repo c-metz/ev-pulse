@@ -87,10 +87,20 @@ def load_current_state(slug: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
-        # Scan only the last 8 days of data using idx_psh_time(collected_at_utc),
-        # then find each point's latest record within that window.
-        # All active providers emit status updates at least daily, so any
-        # point not seen in 8 days is offline/unmonitored and safe to omit.
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "current_point_state" in tables:
+            # O(n_points) lookup — maintained incrementally by the push receiver.
+            df = pd.read_sql_query(
+                "SELECT point_id, status, updated_at AS collected_at_utc"
+                " FROM current_point_state",
+                conn,
+            )
+            if not df.empty:
+                return df
+        # Fallback for databases that haven't received any push since the
+        # current_point_state table was added (brand-new or very old DBs).
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status, h.collected_at_utc

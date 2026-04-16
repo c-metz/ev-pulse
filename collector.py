@@ -159,6 +159,12 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
             ON point_status_history(collected_at_utc);
         CREATE INDEX IF NOT EXISTS idx_psh_snapshot
             ON point_status_history(snapshot_id);
+
+        CREATE TABLE IF NOT EXISTS current_point_state (
+            point_id    TEXT PRIMARY KEY,
+            status      TEXT,
+            updated_at  TEXT
+        );
     """)
 
     # Migrations: add columns that may not exist in older databases
@@ -179,6 +185,20 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
 def load_last_known_state(
     conn: sqlite3.Connection, provider: Provider,
 ) -> pd.DataFrame | None:
+    """Load the most-recent status for every point.
+
+    Reads from ``current_point_state`` (one row per point, maintained
+    incrementally) when possible — O(n_points) regardless of history size.
+    Falls back to the expensive GROUP BY query only when the fast table is
+    empty (e.g., a brand-new database before any deliveries have arrived).
+    """
+    fast = pd.read_sql_query(
+        "SELECT point_id, status FROM current_point_state", conn
+    )
+    if not fast.empty:
+        return fast
+
+    # Fallback: derive from full history (only for empty current_point_state)
     has_data = conn.execute(
         "SELECT 1 FROM point_status_history LIMIT 1"
     ).fetchone()
@@ -190,10 +210,11 @@ def load_last_known_state(
         SELECT h.point_id, {cols}
         FROM point_status_history h
         INNER JOIN (
-            SELECT point_id, MAX(id) AS max_id
+            SELECT point_id, MAX(collected_at_utc) AS max_time
             FROM point_status_history
             GROUP BY point_id
-        ) latest ON h.id = latest.max_id
+        ) latest ON h.point_id = latest.point_id
+                AND h.collected_at_utc = latest.max_time
         """,
         conn,
     )
@@ -329,6 +350,22 @@ def store_dynamic_snapshot(
         insert_df.to_sql(
             "point_status_history", conn, if_exists="append", index=False,
         )
+
+    # ── Step 5: Maintain the fast current-state lookup table ─────────
+    # For a SNAPSHOT we replace the entire set (full ground truth).
+    # For a DELTA we upsert only the changed points.
+    if delivery_type == "SNAPSHOT":
+        conn.execute("DELETE FROM current_point_state")
+        state_rows = updated[["point_id", "status"]].copy()
+        state_rows["updated_at"] = collected_at
+        state_rows.to_sql("current_point_state", conn, if_exists="append", index=False)
+    elif not changed_df.empty:
+        for _, row in changed_df[["point_id", "status"]].iterrows():
+            conn.execute(
+                "INSERT OR REPLACE INTO current_point_state (point_id, status, updated_at)"
+                " VALUES (?, ?, ?)",
+                (row["point_id"], row["status"], collected_at),
+            )
 
     conn.commit()
 
