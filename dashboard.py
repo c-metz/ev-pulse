@@ -352,7 +352,7 @@ def load_eco_price_timeseries() -> pd.DataFrame:
     df = df.dropna(subset=["price_per_kwh"])
     if df.empty:
         return df
-    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df["time"] = pd.to_datetime(df["time"], format="ISO8601", utc=True)
     return (
         df.set_index("time")
           .sort_index()["price_per_kwh"]
