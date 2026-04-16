@@ -187,37 +187,34 @@ def load_last_known_state(
 ) -> pd.DataFrame | None:
     """Load the most-recent status for every point.
 
-    Reads from ``current_point_state`` (one row per point, maintained
-    incrementally) when possible — O(n_points) regardless of history size.
-    Falls back to the expensive GROUP BY query only when the fast table is
-    empty (e.g., a brand-new database before any deliveries have arrived).
-    """
-    fast = pd.read_sql_query(
-        "SELECT point_id, status FROM current_point_state", conn
-    )
-    if not fast.empty:
-        return fast
+    Reads from ``current_point_state`` — one row per point, maintained
+    incrementally by ``store_dynamic_snapshot`` — which is O(n_points)
+    regardless of how large ``point_status_history`` has grown.
 
-    # Fallback: derive from full history (only for empty current_point_state)
-    has_data = conn.execute(
-        "SELECT 1 FROM point_status_history LIMIT 1"
-    ).fetchone()
-    if not has_data:
+    Returns None when ``current_point_state`` is empty (e.g. after a fresh
+    install or after the table was just added). The push receiver will then
+    treat all points in the next delivery as new, which is correct for a
+    SNAPSHOT and a safe approximation for DELTAs (counts recover on the next
+    SNAPSHOT, which arrives at most once per day).
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "current_point_state" not in tables:
         return None
-    cols = ", ".join(f"h.{col}" for col in provider.tracked_columns)
-    return pd.read_sql_query(
-        f"""
-        SELECT h.point_id, {cols}
-        FROM point_status_history h
-        INNER JOIN (
-            SELECT point_id, MAX(collected_at_utc) AS max_time
-            FROM point_status_history
-            GROUP BY point_id
-        ) latest ON h.point_id = latest.point_id
-                AND h.collected_at_utc = latest.max_time
-        """,
-        conn,
-    )
+
+    df = pd.read_sql_query("SELECT point_id, status FROM current_point_state", conn)
+    if df.empty:
+        return None
+    # Add any tracked columns not stored in current_point_state as None.
+    # find_changed_rows will see these as "unknown" previous values, which
+    # causes a one-time burst of extra history rows on restart (non-status
+    # tracked fields like price_per_kwh will all appear changed). This
+    # self-corrects after the first SNAPSHOT repopulates the full state.
+    for col in provider.tracked_columns:
+        if col not in df.columns:
+            df[col] = None
+    return df
 
 
 def get_cursor(conn: sqlite3.Connection) -> str | None:
