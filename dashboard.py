@@ -245,16 +245,39 @@ def get_dynamic_time_range(slug: str) -> tuple[datetime, datetime] | None:
     )
 
 
-@st.cache_data(ttl=600, max_entries=300)
+@st.cache_data(ttl=60, max_entries=300)
 def load_state_at(slug: str, ts_iso: str) -> pd.DataFrame:
-    """Reconstruct each point's last-known status as of *ts_iso*."""
+    """Reconstruct each point's last-known status as of *ts_iso*.
+
+    Fast path: if ts_iso is within the last 5 minutes, return
+    current_point_state directly (O(n_points), avoids full history scan).
+    Historical path: bounded GROUP BY over the 8-day window.
+    """
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     if not db.exists():
         return pd.DataFrame()
+
+    # Fast path: requested time ≈ "now" → current_point_state is exact
+    try:
+        ts_dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        age_minutes = (datetime.now(timezone.utc) - ts_dt).total_seconds() / 60
+    except Exception:
+        age_minutes = 999
+
     with sqlite3.connect(db) as conn:
-        # Bound scan to the 8-day window (time scrubber already limited there).
-        # Uses idx_psh_time(collected_at_utc) to pre-filter, then
-        # idx_psh_point_time for the GROUP BY.
+        if age_minutes < 5:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "current_point_state" in tables:
+                df = pd.read_sql_query(
+                    "SELECT point_id, status FROM current_point_state", conn
+                )
+                if not df.empty:
+                    return df
+
+        # Historical path: bounded to 8-day window so idx_psh_time can
+        # pre-filter rows before the GROUP BY.
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status
