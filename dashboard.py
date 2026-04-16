@@ -92,29 +92,15 @@ def load_current_state(slug: str) -> pd.DataFrame:
         ).fetchall()}
         if "current_point_state" in tables:
             # O(n_points) lookup — maintained incrementally by the push receiver.
-            df = pd.read_sql_query(
+            # Returns empty DataFrame if not yet populated; the map will show
+            # nothing until the first push delivery arrives (usually seconds).
+            return pd.read_sql_query(
                 "SELECT point_id, status, updated_at AS collected_at_utc"
                 " FROM current_point_state",
                 conn,
             )
-            if not df.empty:
-                return df
-        # Fallback for databases that haven't received any push since the
-        # current_point_state table was added (brand-new or very old DBs).
-        return pd.read_sql_query(
-            """
-            SELECT h.point_id, h.status, h.collected_at_utc
-            FROM point_status_history h
-            INNER JOIN (
-                SELECT point_id, MAX(collected_at_utc) AS max_time
-                FROM point_status_history
-                WHERE collected_at_utc >= datetime('now', '-8 days')
-                GROUP BY point_id
-            ) latest ON h.point_id = latest.point_id
-                    AND h.collected_at_utc = latest.max_time
-            """,
-            conn,
-        )
+        # Table not created yet — return empty (avoids expensive GROUP BY scan).
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
