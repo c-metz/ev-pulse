@@ -52,14 +52,6 @@ PROVIDERS = {
         "to_mw": 1e-6,
         "color": "#ff7f0e",
     },
-    "ladenetz": {
-        "label": "ladenetz",
-        "in_use": "charging",
-        "in_use_col": "charging_count",
-        "power_col": "point_power_w",
-        "to_mw": 1e-6,
-        "color": "#17becf",
-    },
 }
 
 BUNDESLAENDER_GEOJSON_URL = (
