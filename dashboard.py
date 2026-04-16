@@ -87,9 +87,10 @@ def load_current_state(slug: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
-        # Use MAX(collected_at_utc) GROUP BY point_id — resolved by the
-        # existing idx_psh_point_time(point_id, collected_at_utc) index,
-        # which is O(n_unique_points) not O(all_rows).
+        # Scan only the last 8 days of data using idx_psh_time(collected_at_utc),
+        # then find each point's latest record within that window.
+        # All active providers emit status updates at least daily, so any
+        # point not seen in 8 days is offline/unmonitored and safe to omit.
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status, h.collected_at_utc
@@ -97,6 +98,7 @@ def load_current_state(slug: str) -> pd.DataFrame:
             INNER JOIN (
                 SELECT point_id, MAX(collected_at_utc) AS max_time
                 FROM point_status_history
+                WHERE collected_at_utc >= datetime('now', '-8 days')
                 GROUP BY point_id
             ) latest ON h.point_id = latest.point_id
                     AND h.collected_at_utc = latest.max_time
@@ -254,8 +256,9 @@ def load_state_at(slug: str, ts_iso: str) -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     with sqlite3.connect(db) as conn:
-        # MAX(collected_at_utc) with WHERE collected_at_utc <= ? uses
-        # idx_psh_point_time(point_id, collected_at_utc) efficiently.
+        # Bound scan to the 8-day window (time scrubber already limited there).
+        # Uses idx_psh_time(collected_at_utc) to pre-filter, then
+        # idx_psh_point_time for the GROUP BY.
         return pd.read_sql_query(
             """
             SELECT h.point_id, h.status
@@ -263,7 +266,8 @@ def load_state_at(slug: str, ts_iso: str) -> pd.DataFrame:
             INNER JOIN (
                 SELECT point_id, MAX(collected_at_utc) AS max_time
                 FROM point_status_history
-                WHERE collected_at_utc <= ?
+                WHERE collected_at_utc >= datetime('now', '-8 days')
+                  AND collected_at_utc <= ?
                 GROUP BY point_id
             ) latest ON h.point_id = latest.point_id
                     AND h.collected_at_utc = latest.max_time
