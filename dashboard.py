@@ -213,6 +213,25 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
+    # ── Outlier suppression ──────────────────────────────────────────
+    # Individual DELTA rows occasionally report power far below their
+    # neighbours (transient computation artefacts during delivery bursts).
+    # A short rolling median removes isolated spikes while preserving the
+    # real trend and the drift-correction shape.
+    if len(timeline) >= 5:
+        timeline["power_mw"] = (
+            timeline["power_mw"]
+            .rolling("3min", min_periods=1, center=True)
+            .median()
+        )
+
+    # ── Physical lower bound ─────────────────────────────────────────
+    # Estimated power is SUM(nameplate_rated_power) over points in use,
+    # so it is mathematically non-negative. The proportional drift
+    # correction can over-subtract when true power is non-monotonic
+    # between two SNAPSHOTs; clip to zero.
+    timeline["power_mw"] = timeline["power_mw"].clip(lower=0)
+
     # Return the last SNAPSHOT time for uncorrected-region shading
     return timeline, snap_df
 
