@@ -9,7 +9,7 @@ Run:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -152,10 +152,27 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not db.exists():
         return empty
 
+    # 8-day display window. We extend the SQL query BACKWARDS to include
+    # the last SNAPSHOT before this cutoff (if any), so the earliest
+    # visible data points have a drift-correction anchor on their left.
+    # Without this, the region before the first in-window SNAPSHOT is
+    # never corrected and shows a cliff-drop at that SNAPSHOT.
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=8)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     with sqlite3.connect(db) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshot_runs)").fetchall()}
         if "estimated_power_mw" not in cols:
             return empty
+
+        anchor_row = conn.execute(
+            """SELECT MAX(collected_at_utc) FROM snapshot_runs
+               WHERE delivery_type = 'SNAPSHOT'
+                 AND collected_at_utc < ?""",
+            (cutoff_str,),
+        ).fetchone()
+        anchor_time = anchor_row[0] if anchor_row else None
+        query_from = anchor_time if anchor_time else cutoff_str
 
         power_df = pd.read_sql_query(
             """
@@ -163,10 +180,11 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                    estimated_power_mw AS power_mw,
                    delivery_type
             FROM snapshot_runs
-            WHERE collected_at_utc >= datetime('now', '-8 days')
+            WHERE collected_at_utc >= ?
             ORDER BY snapshot_id
             """,
             conn,
+            params=(query_from,),
         )
 
     if power_df.empty:
@@ -231,6 +249,23 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     # correction can over-subtract when true power is non-monotonic
     # between two SNAPSHOTs; clip to zero.
     timeline["power_mw"] = timeline["power_mw"].clip(lower=0)
+
+    # ── Trim to the 8-day display window ─────────────────────────────
+    # The extra pre-cutoff anchor row was pulled in only to give the
+    # earliest visible point a left-side drift-correction anchor.
+    if getattr(timeline.index, "tz", None) is None:
+        cutoff_ts = pd.Timestamp(cutoff_dt.replace(tzinfo=None))
+    else:
+        cutoff_ts = pd.Timestamp(cutoff_dt)
+    timeline = timeline[timeline.index >= cutoff_ts]
+    if not snap_df.empty:
+        snap_t = snap_df["time"]
+        snap_tz = getattr(snap_t.dt, "tz", None)
+        snap_cutoff = (
+            pd.Timestamp(cutoff_dt.replace(tzinfo=None))
+            if snap_tz is None else pd.Timestamp(cutoff_dt)
+        )
+        snap_df = snap_df[snap_t >= snap_cutoff]
 
     # Return the last SNAPSHOT time for uncorrected-region shading
     return timeline, snap_df
