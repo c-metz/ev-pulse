@@ -147,7 +147,13 @@ def load_snapshot_meta(slug: str) -> dict:
 
 @st.cache_data(ttl=60)
 def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the MW timeline (last 8 days) with drift correction, plus SNAPSHOT timestamps."""
+    """Load the MW timeline (last 8 days) aggregated to 5-minute buckets
+    with drift correction, plus the SNAPSHOT bucket timestamps.
+
+    Aggregation is done in SQL so the dashboard never materialises the
+    raw per-delivery rows. Databases keep full granularity on disk;
+    see the GitHub repository to work with the raw data directly.
+    """
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
     if not db.exists():
@@ -155,9 +161,7 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     # 8-day display window. We extend the SQL query BACKWARDS to include
     # the last SNAPSHOT before this cutoff (if any), so the earliest
-    # visible data points have a drift-correction anchor on their left.
-    # Without this, the region before the first in-window SNAPSHOT is
-    # never corrected and shows a cliff-drop at that SNAPSHOT.
+    # visible bucket has a drift-correction anchor on its left.
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=8)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -175,14 +179,32 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         anchor_time = anchor_row[0] if anchor_row else None
         query_from = anchor_time if anchor_time else cutoff_str
 
+        # 5-minute bucketing in SQL. The bucket is the floor of
+        # unix-epoch-seconds / 300. Buckets containing a SNAPSHOT take
+        # the SNAPSHOT's own power (ground truth); purely-DELTA buckets
+        # take the mean of their DELTA rows. n_deltas is kept so the
+        # throttle detector can flag upstream delivery stalls.
         power_df = pd.read_sql_query(
             """
-            SELECT collected_at_utc AS time,
-                   estimated_power_mw AS power_mw,
-                   delivery_type
+            SELECT
+                datetime(
+                    (CAST(strftime('%s', collected_at_utc) AS INTEGER) / 300) * 300,
+                    'unixepoch'
+                ) AS time,
+                CASE
+                    WHEN MAX(CASE WHEN delivery_type='SNAPSHOT' THEN 1 ELSE 0 END) = 1
+                    THEN AVG(CASE WHEN delivery_type='SNAPSHOT'
+                                  THEN estimated_power_mw END)
+                    ELSE AVG(estimated_power_mw)
+                END AS power_mw,
+                MAX(CASE WHEN delivery_type='SNAPSHOT' THEN 1 ELSE 0 END)
+                    AS has_snapshot,
+                COUNT(CASE WHEN delivery_type='DELTA' THEN 1 END) AS n_deltas
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
-            ORDER BY snapshot_id
+              AND estimated_power_mw IS NOT NULL
+            GROUP BY time
+            ORDER BY time
             """,
             conn,
             params=(query_from,),
@@ -191,16 +213,13 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     if power_df.empty:
         return empty
 
-    power_df["time"] = pd.to_datetime(power_df["time"], format="ISO8601")
-
-    # ── Fill NULL power on SNAPSHOT rows ─────────────────────────────
-    snap_mask = power_df["delivery_type"] == "SNAPSHOT"
-    for idx in power_df.index[snap_mask & power_df["power_mw"].isna()]:
-        after = power_df.loc[idx + 1:, "power_mw"].dropna()
-        if not after.empty:
-            power_df.at[idx, "power_mw"] = after.iloc[0]
-
+    power_df["time"] = pd.to_datetime(power_df["time"], utc=True)
+    power_df["delivery_type"] = np.where(
+        power_df["has_snapshot"] == 1, "SNAPSHOT", "DELTA"
+    )
     power_df = power_df.dropna(subset=["power_mw"]).reset_index(drop=True)
+    if power_df.empty:
+        return empty
 
     # ── Proportional drift correction (vectorised) ─────────────────
     snap_mask = power_df["delivery_type"] == "SNAPSHOT"
@@ -248,37 +267,24 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
     # ── Upstream-throttle detection ──────────────────────────────────
-    # When the provider's delivery rate collapses (seen e.g. on
-    # eco-movement on 2026-04-16 18:40+), most points stop getting
-    # status updates, so the accumulated aggregate power freezes near
-    # whatever was "in use" at the time of the throttle -- producing a
-    # fake plateau/spike that the linear drift correction cannot
-    # untangle. Flag 5-min bins whose delivery count drops below 20%
-    # of the series median and replace those values with a time-
-    # weighted interpolation from the surrounding healthy data.
+    # When the provider's delivery rate collapses, most points stop
+    # getting status updates and the aggregate freezes near whatever
+    # was "in use" at the time -- producing a fake plateau the linear
+    # drift correction cannot untangle. Flag buckets whose DELTA count
+    # is < 20% of the series median, but only if they form a run of
+    # >= 4 consecutive low buckets (20+ min) so naturally quiet night
+    # hours on variable providers (e.g. EnBW) are not flagged.
     try:
-        counts = power_df.set_index("time").resample("5min").size()
-        if len(counts) >= 12:  # need at least ~1h of data
+        counts = power_df.set_index("time")["n_deltas"]
+        if len(counts) >= 12:
             baseline = float(counts.median())
             if baseline >= 10:
-                # Require a SUSTAINED low-rate run. Single 5-min dips
-                # happen naturally during quiet night hours on variable
-                # providers (e.g. EnBW p10=7 vs p50=126) and should not
-                # be flagged. Only stretches of >= 4 consecutive low
-                # bins (20+ minutes) count as an upstream throttle.
                 low = counts < 0.2 * baseline
                 run_id = (low != low.shift()).cumsum()
                 run_lengths = low.groupby(run_id).transform("sum")
-                flagged = low & (run_lengths >= 4)
-                flagged_bins = counts.index[flagged]
-                if len(flagged_bins):
-                    bin_delta = pd.Timedelta("5min")
-                    mask = pd.Series(False, index=timeline.index)
-                    for bin_start in flagged_bins:
-                        mask |= (
-                            (timeline.index >= bin_start)
-                            & (timeline.index < bin_start + bin_delta)
-                        )
+                flagged_idx = counts.index[low & (run_lengths >= 4)]
+                if len(flagged_idx):
+                    mask = timeline.index.isin(flagged_idx)
                     if mask.any():
                         timeline.loc[mask, "power_mw"] = np.nan
                         timeline["power_mw"] = timeline["power_mw"].interpolate(
@@ -287,15 +293,11 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     except Exception:  # never let smoothing break the chart
         pass
 
-    # ── Outlier suppression ──────────────────────────────────────────
-    # Individual DELTA rows occasionally report power far below their
-    # neighbours (transient computation artefacts during delivery bursts).
-    # A short rolling median removes isolated spikes while preserving the
-    # real trend and the drift-correction shape.
+    # ── Outlier suppression (3-bucket = 15-min rolling median) ───────
     if len(timeline) >= 5:
         timeline["power_mw"] = (
             timeline["power_mw"]
-            .rolling("3min", min_periods=1, center=True)
+            .rolling(3, min_periods=1, center=True)
             .median()
         )
 
@@ -561,6 +563,13 @@ with st.sidebar:
         "This is an upper bound. Actual grid draw depends on vehicle SOC, "
         "charging curve, cable limits, and load management."
     )
+    st.caption(
+        "**Granularity** -- The timeline is aggregated to 5-minute "
+        "buckets for a responsive interface. The underlying SQLite "
+        "databases retain every status transition at native resolution; "
+        "for the raw data, check out the "
+        "[GitHub repository](https://github.com/c-metz/ev-pulse)."
+    )
 
 # ── Load data ─────────────────────────────────────────────────────────
 all_states: dict[str, pd.DataFrame] = {}
@@ -591,12 +600,10 @@ if power_traces:
     snap_times = set()
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
-        # Downsample for plot performance, but drop empty bins instead
-        # of ffill'ing them. Forward-filling a missing minute produces a
-        # fake horizontal line; dropping lets Plotly connect the nearest
-        # real points directly, and if delivery stops (e.g. EnBW today),
-        # the trace just ends at the last real point.
-        resampled = ts.resample("1min").mean().dropna()
+        # Data already 5-min aggregated at the SQL level. Drop any
+        # empty buckets so gaps (e.g. a stalled upstream feed) show
+        # as a terminated line rather than a forward-filled plateau.
+        resampled = ts.dropna()
         if resampled.empty:
             continue
 
