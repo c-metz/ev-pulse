@@ -247,6 +247,37 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     snap_df = power_df.loc[snap_mask, ["time"]].copy()
     timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
 
+    # ── Upstream-throttle detection ──────────────────────────────────
+    # When the provider's delivery rate collapses (seen e.g. on
+    # eco-movement on 2026-04-16 18:40+), most points stop getting
+    # status updates, so the accumulated aggregate power freezes near
+    # whatever was "in use" at the time of the throttle -- producing a
+    # fake plateau/spike that the linear drift correction cannot
+    # untangle. Flag 5-min bins whose delivery count drops below 20%
+    # of the series median and replace those values with a time-
+    # weighted interpolation from the surrounding healthy data.
+    try:
+        counts = power_df.set_index("time").resample("5min").size()
+        if len(counts) >= 12:  # need at least ~1h of data
+            baseline = float(counts.median())
+            if baseline >= 10:
+                low_bins = counts.index[counts < 0.2 * baseline]
+                if len(low_bins):
+                    bin_delta = pd.Timedelta("5min")
+                    mask = pd.Series(False, index=timeline.index)
+                    for bin_start in low_bins:
+                        mask |= (
+                            (timeline.index >= bin_start)
+                            & (timeline.index < bin_start + bin_delta)
+                        )
+                    if mask.any():
+                        timeline.loc[mask, "power_mw"] = np.nan
+                        timeline["power_mw"] = timeline["power_mw"].interpolate(
+                            method="time", limit_direction="both"
+                        )
+    except Exception:  # never let smoothing break the chart
+        pass
+
     # ── Outlier suppression ──────────────────────────────────────────
     # Individual DELTA rows occasionally report power far below their
     # neighbours (transient computation artefacts during delivery bursts).
