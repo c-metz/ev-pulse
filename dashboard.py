@@ -12,6 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
@@ -207,6 +208,7 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     power_vals = power_df["power_mw"].values.copy()
     times_i64 = power_df["time"].values.astype("int64")
 
+    drift_rates_per_ns: list[float] = []  # MW accumulated per nanosecond
     for i in range(len(snap_indices) - 1):
         idx_a = snap_indices[i]
         idx_b = snap_indices[i + 1]
@@ -215,16 +217,30 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         power_at_b = power_vals[idx_b]
         power_before_b = power_vals[idx_b - 1]
         jump = power_before_b - power_at_b
-        if abs(jump) < 0.01:
-            continue
         t_a = times_i64[idx_a]
         t_b = times_i64[idx_b]
         span = t_b - t_a
         if span <= 0:
             continue
+        drift_rates_per_ns.append(jump / span)
+        if abs(jump) < 0.01:
+            continue
         sl = slice(idx_a + 1, idx_b)
         frac = (times_i64[sl] - t_a) / span
         power_vals[sl] -= jump * frac
+
+    # ── Extrapolate correction past the last SNAPSHOT ──────────────
+    # The post-last-SNAPSHOT region has no right-side anchor. Use the
+    # median drift rate from prior inter-SNAPSHOT intervals to project
+    # the expected accumulated overestimate forward in time.
+    if snap_indices and drift_rates_per_ns:
+        last_snap_idx = snap_indices[-1]
+        if last_snap_idx + 1 < len(power_vals):
+            drift_rate = float(np.median(drift_rates_per_ns))
+            t_last = times_i64[last_snap_idx]
+            sl_tail = slice(last_snap_idx + 1, len(power_vals))
+            dt = times_i64[sl_tail] - t_last
+            power_vals[sl_tail] -= drift_rate * dt
 
     power_df["power_mw"] = power_vals
 
