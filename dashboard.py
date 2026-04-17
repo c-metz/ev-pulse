@@ -293,12 +293,15 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     except Exception:  # never let smoothing break the chart
         pass
 
-    # ── Outlier suppression (3-bucket = 15-min rolling median) ───────
+    # ── Visual smoothing (30-min centred rolling mean) ───────────────
+    # Applied on top of drift correction and throttle interpolation to
+    # present a clean curve free of residual 5-min jitter. This is a
+    # visualisation aid only; the underlying DB rows are untouched.
     if len(timeline) >= 5:
         timeline["power_mw"] = (
             timeline["power_mw"]
-            .rolling(3, min_periods=1, center=True)
-            .median()
+            .rolling(6, min_periods=1, center=True)
+            .mean()
         )
 
     # ── Physical lower bound ─────────────────────────────────────────
@@ -544,18 +547,16 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "**Methodology** -- Dashed vertical lines on the timeline mark "
-        "**SNAPSHOT** deliveries (complete ground-truth state resets from "
-        "the upstream data provider). Between snapshots, the state is "
-        "reconstructed from incremental **DELTA** updates via Mobilithek's "
-        "delta-pull protocol. "
-        "Because some status transitions are missed between polls "
-        "(the Mobilithek packet buffer overwrites unread deliveries), "
-        "the accumulated state drifts -- typically overestimating active "
-        "chargers. A **proportional drift correction** is applied: the "
-        "error is linearly distributed between consecutive SNAPSHOT "
-        "anchors, preserving the shape of intraday fluctuations. "
-        "The shaded region after the last SNAPSHOT has not been corrected."
+        "**Methodology** -- Each provider delivers a full-state "
+        "**SNAPSHOT** roughly once per day, with incremental **DELTA** "
+        "updates in between. Because some status transitions are lost "
+        "between pushes (the Mobilithek packet buffer overwrites unread "
+        "deliveries), the DELTA-only state drifts, typically "
+        "overestimating active chargers. A **proportional drift "
+        "correction** is applied, linearly distributing the error "
+        "between consecutive SNAPSHOT anchors. A **30-minute centred "
+        "rolling mean** is then applied purely for visualisation "
+        "(DB rows are not altered)."
     )
     st.caption(
         "**Power estimation** -- "
@@ -596,91 +597,22 @@ for slug in selected_providers:
 if power_traces:
     fig = go.Figure()
 
-    # ── Per-provider traces: solid where corrected, dashed where not ──
-    snap_times = set()
+    # ── Per-provider traces (single solid line each) ─────────────────
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
-        # Data already 5-min aggregated at the SQL level. Drop any
-        # empty buckets so gaps (e.g. a stalled upstream feed) show
-        # as a terminated line rather than a forward-filled plateau.
+        # Data already 5-min aggregated + smoothed at the SQL / load
+        # layer. Drop any empty buckets so upstream stalls terminate
+        # the line rather than being forward-filled.
         resampled = ts.dropna()
         if resampled.empty:
             continue
-
-        snaps = snapshot_markers.get(slug)
-        last_snap_ts = (
-            pd.Timestamp(snaps["time"].max()) if snaps is not None and not snaps.empty
-            else None
-        )
-
-        if last_snap_ts is not None and last_snap_ts < resampled.index.max():
-            # Split at the provider's own last SNAPSHOT
-            corrected = resampled.loc[:last_snap_ts]
-            uncorrected = resampled.loc[last_snap_ts:]  # overlap at boundary for continuity
-
-            if not corrected.empty:
-                fig.add_trace(go.Scatter(
-                    x=corrected.index, y=corrected["power_mw"],
-                    name=cfg["label"], legendgroup=cfg["label"],
-                    mode="lines",
-                    line=dict(width=1.2, color=cfg["color"]),
-                    hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
-                ))
-            if len(uncorrected) > 1:
-                fig.add_trace(go.Scatter(
-                    x=uncorrected.index, y=uncorrected["power_mw"],
-                    name=cfg["label"] + " (uncorrected)",
-                    legendgroup=cfg["label"], showlegend=False,
-                    mode="lines",
-                    line=dict(width=1.2, color=cfg["color"], dash="dash"),
-                    hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + " (uncorrected)</extra>",
-                ))
-        else:
-            # No split possible — entire trace is uncorrected (or brand new)
-            is_uncorrected = last_snap_ts is None and len(resampled) > 1
-            fig.add_trace(go.Scatter(
-                x=resampled.index, y=resampled["power_mw"],
-                name=cfg["label"],
-                mode="lines",
-                line=dict(width=1.2, color=cfg["color"],
-                          dash="dash" if is_uncorrected else "solid"),
-                hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
-            ))
-
-    # ── SNAPSHOT markers ──────────────────────────────────────────────
-    for snaps in snapshot_markers.values():
-        for t in snaps["time"]:
-            snap_times.add(t)
-
-    for snap_t in sorted(snap_times):
-        x_val = pd.Timestamp(snap_t).to_pydatetime()
-        fig.add_shape(
-            type="line", x0=x_val, x1=x_val,
-            y0=0, y1=1, yref="paper",
-            line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dash"),
-        )
-        fig.add_annotation(
-            x=x_val, y=1.0, yref="paper",
-            text="SNAPSHOT",
-            font=dict(size=9, color="rgba(255,255,255,0.45)"),
-            showarrow=False, yanchor="bottom",
-        )
-
-    # ── "Not yet drift-corrected" annotation at the transition ────────
-    for slug in power_traces:
-        snaps = snapshot_markers.get(slug)
-        if snaps is None or snaps.empty:
-            continue
-        last_snap_dt = pd.Timestamp(snaps["time"].max()).to_pydatetime()
-        ts_end = power_traces[slug].index.max()
-        if pd.Timestamp(ts_end).to_pydatetime() > last_snap_dt:
-            fig.add_annotation(
-                x=last_snap_dt, y=0.97, yref="paper",
-                text="not yet drift-corrected  \u27A1",
-                font=dict(size=9, color="rgba(255, 180, 80, 0.7)"),
-                showarrow=False, xanchor="left",
-            )
-            break  # one annotation is enough
+        fig.add_trace(go.Scatter(
+            x=resampled.index, y=resampled["power_mw"],
+            name=cfg["label"],
+            mode="lines",
+            line=dict(width=1.4, color=cfg["color"]),
+            hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
+        ))
 
     fig.update_layout(
         height=350,
