@@ -261,11 +261,20 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         if len(counts) >= 12:  # need at least ~1h of data
             baseline = float(counts.median())
             if baseline >= 10:
-                low_bins = counts.index[counts < 0.2 * baseline]
-                if len(low_bins):
+                # Require a SUSTAINED low-rate run. Single 5-min dips
+                # happen naturally during quiet night hours on variable
+                # providers (e.g. EnBW p10=7 vs p50=126) and should not
+                # be flagged. Only stretches of >= 4 consecutive low
+                # bins (20+ minutes) count as an upstream throttle.
+                low = counts < 0.2 * baseline
+                run_id = (low != low.shift()).cumsum()
+                run_lengths = low.groupby(run_id).transform("sum")
+                flagged = low & (run_lengths >= 4)
+                flagged_bins = counts.index[flagged]
+                if len(flagged_bins):
                     bin_delta = pd.Timedelta("5min")
                     mask = pd.Series(False, index=timeline.index)
-                    for bin_start in low_bins:
+                    for bin_start in flagged_bins:
                         mask |= (
                             (timeline.index >= bin_start)
                             & (timeline.index < bin_start + bin_delta)
@@ -582,7 +591,14 @@ if power_traces:
     snap_times = set()
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
-        resampled = ts.resample("1min").last().ffill()
+        # Downsample for plot performance, but drop empty bins instead
+        # of ffill'ing them. Forward-filling a missing minute produces a
+        # fake horizontal line; dropping lets Plotly connect the nearest
+        # real points directly, and if delivery stops (e.g. EnBW today),
+        # the trace just ends at the last real point.
+        resampled = ts.resample("1min").mean().dropna()
+        if resampled.empty:
+            continue
 
         snaps = snapshot_markers.get(slug)
         last_snap_ts = (
