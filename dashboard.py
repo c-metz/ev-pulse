@@ -283,7 +283,11 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         snap_val = float(power_df["snap_mw"].iat[i])
         if delta_est <= 0 or snap_val <= 0:
             continue
-        k_at_snap[i] = float(np.clip(snap_val / delta_est, 0.05, 1.5))
+        # Clip to a sane range. Below 0.10 the band is too wide to be
+        # useful (one broken SNAPSHOT shouldn't pin the floor near
+        # zero); above 1.0 is non-physical (SNAPSHOT should never
+        # exceed concurrent DELTA).
+        k_at_snap[i] = float(np.clip(snap_val / delta_est, 0.10, 1.0))
 
     k_series = pd.Series(k_at_snap, index=power_df.index)
     if k_series.notna().any():
@@ -631,18 +635,19 @@ for slug in selected_providers:
 if power_traces:
     fig = go.Figure()
 
-    # ── Per-provider range band (upper=raw DELTA, lower=SNAPSHOT-scaled)
-    # Truth sits inside the band. Width expresses the DELTA-drift
-    # uncertainty: narrow near a SNAPSHOT anchor, wider further away.
+    # ── Per-provider line + soft uncertainty halo ────────────────────
+    # The solid line is the midpoint of the upper (raw DELTA) and
+    # lower (SNAPSHOT-scaled) estimates. A subtle fill between upper
+    # and lower forms a halo expressing the DELTA-drift uncertainty.
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
-        if ts["power_mw_upper"].isna().all():
+        if ts["power_mw"].isna().all():
             continue
         label = cfg["label"]
         color = cfg["color"]
-        fill_rgba = _hex_to_rgba(color, 0.18)
+        fill_rgba = _hex_to_rgba(color, 0.10)
 
-        # Upper edge: invisible line that the fill anchors against.
+        # Upper edge: invisible — fill anchor only.
         fig.add_trace(go.Scatter(
             x=ts.index, y=ts["power_mw_upper"],
             name=f"{label} upper",
@@ -652,19 +657,33 @@ if power_traces:
             hoverinfo="skip",
             connectgaps=False,
         ))
-        # Lower edge: visible line, fills up to the previous trace.
-        upper_cd = ts["power_mw_upper"].values.reshape(-1, 1)
+        # Lower edge: invisible, carries the fill up to the upper.
         fig.add_trace(go.Scatter(
             x=ts.index, y=ts["power_mw_lower"],
-            name=label,
+            name=f"{label} lower",
             mode="lines",
-            line=dict(width=1.4, color=color),
+            line=dict(width=0, color=color),
             fill="tonexty",
             fillcolor=fill_rgba,
+            showlegend=False,
+            hoverinfo="skip",
             connectgaps=False,
-            customdata=upper_cd,
+        ))
+        # Midpoint: the primary visual.
+        mid_cd = np.stack([
+            ts["power_mw_lower"].values,
+            ts["power_mw_upper"].values,
+        ], axis=-1)
+        fig.add_trace(go.Scatter(
+            x=ts.index, y=ts["power_mw"],
+            name=label,
+            mode="lines",
+            line=dict(width=1.5, color=color),
+            connectgaps=False,
+            customdata=mid_cd,
             hovertemplate=(
-                "%{y:.0f}–%{customdata[0]:.0f} MW"
+                "%{y:.0f} MW  (range %{customdata[0]:.0f}"
+                "–%{customdata[1]:.0f})"
                 "<extra>" + label + "</extra>"
             ),
         ))
