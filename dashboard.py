@@ -61,6 +61,13 @@ BUNDESLAENDER_GEOJSON_URL = (
 )
 
 
+def _hex_to_rgba(hex_color: str, alpha: float = 0.18) -> str:
+    """Convert '#1f77b4' -> 'rgba(31,119,180,0.18)' for Plotly fill colours."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════
@@ -147,21 +154,33 @@ def load_snapshot_meta(slug: str) -> dict:
 
 @st.cache_data(ttl=60)
 def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the MW timeline (last 8 days) aggregated to 5-minute buckets
-    with drift correction, plus the SNAPSHOT bucket timestamps.
+    """Load the MW timeline (last 8 days) aggregated to 5-minute buckets,
+    returned as a **range band**: upper = raw DELTA-derived estimate
+    (overestimates because the DELTA protocol accumulates upward drift),
+    lower = SNAPSHOT-anchored floor (DELTA scaled multiplicatively by the
+    SNAPSHOT/DELTA ratio k(t), interpolated between SNAPSHOTs).
 
-    Aggregation is done in SQL so the dashboard never materialises the
-    raw per-delivery rows. Databases keep full granularity on disk;
-    see the GitHub repository to work with the raw data directly.
+    The band expresses the inherent uncertainty: on eco-movement SNAPSHOTs
+    typically confirm only 30-50% of the DELTA-derived "in-use" count, so
+    truth sits somewhere inside the band. Plotting the single "corrected"
+    line falsely implied precision we don't have.
+
+    Returns a timeline DataFrame indexed by time with columns
+    ``power_mw_upper``, ``power_mw_lower`` and ``power_mw`` (midpoint,
+    kept for downstream consumers: heatmap, VRE correlation, CSV export).
     """
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
-    empty = pd.DataFrame(columns=["time", "power_mw"]), pd.DataFrame(columns=["time"])
+    empty_cols = ["power_mw", "power_mw_lower", "power_mw_upper"]
+    empty = (
+        pd.DataFrame(columns=empty_cols),
+        pd.DataFrame(columns=["time"]),
+    )
     if not db.exists():
         return empty
 
-    # 8-day display window. We extend the SQL query BACKWARDS to include
-    # the last SNAPSHOT before this cutoff (if any), so the earliest
-    # visible bucket has a drift-correction anchor on its left.
+    # 8-day display window. Extend the query backwards to the most recent
+    # SNAPSHOT before cutoff so the earliest visible bucket has an anchor
+    # on its left for the k(t) interpolation.
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=8)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -170,20 +189,22 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         if "estimated_power_mw" not in cols:
             return empty
 
+        # Look at most 2 days back for a pre-cutoff SNAPSHOT anchor so
+        # a provider with stale SNAPSHOTs (e.g. Tesla, none in weeks)
+        # doesn't force us to scan far more than the 8-day window.
         anchor_row = conn.execute(
             """SELECT MAX(collected_at_utc) FROM snapshot_runs
                WHERE delivery_type = 'SNAPSHOT'
-                 AND collected_at_utc < ?""",
-            (cutoff_str,),
+                 AND collected_at_utc < ?
+                 AND collected_at_utc >= datetime(?, '-2 days')""",
+            (cutoff_str, cutoff_str),
         ).fetchone()
         anchor_time = anchor_row[0] if anchor_row else None
         query_from = anchor_time if anchor_time else cutoff_str
 
-        # 5-minute bucketing in SQL. The bucket is the floor of
-        # unix-epoch-seconds / 300. Buckets containing a SNAPSHOT take
-        # the SNAPSHOT's own power (ground truth); purely-DELTA buckets
-        # take the mean of their DELTA rows. n_deltas is kept so the
-        # throttle detector can flag upstream delivery stalls.
+        # 5-minute bucketing in SQL. Separate columns for DELTA and
+        # SNAPSHOT means so we can build upper (DELTA-only) and the
+        # k-ratio (SNAPSHOT/DELTA) independently in Python.
         power_df = pd.read_sql_query(
             """
             SELECT
@@ -191,15 +212,12 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                     (CAST(strftime('%s', collected_at_utc) AS INTEGER) / 300) * 300,
                     'unixepoch'
                 ) AS time,
-                CASE
-                    WHEN MAX(CASE WHEN delivery_type='SNAPSHOT' THEN 1 ELSE 0 END) = 1
-                    THEN AVG(CASE WHEN delivery_type='SNAPSHOT'
-                                  THEN estimated_power_mw END)
-                    ELSE AVG(estimated_power_mw)
-                END AS power_mw,
-                MAX(CASE WHEN delivery_type='SNAPSHOT' THEN 1 ELSE 0 END)
-                    AS has_snapshot,
-                COUNT(CASE WHEN delivery_type='DELTA' THEN 1 END) AS n_deltas
+                AVG(CASE WHEN delivery_type='DELTA'
+                         THEN estimated_power_mw END) AS delta_mw,
+                AVG(CASE WHEN delivery_type='SNAPSHOT'
+                         THEN estimated_power_mw END) AS snap_mw,
+                COUNT(CASE WHEN delivery_type='DELTA'    THEN 1 END) AS n_deltas,
+                COUNT(CASE WHEN delivery_type='SNAPSHOT' THEN 1 END) AS n_snaps
             FROM snapshot_runs
             WHERE collected_at_utc >= ?
               AND estimated_power_mw IS NOT NULL
@@ -214,132 +232,126 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         return empty
 
     power_df["time"] = pd.to_datetime(power_df["time"], utc=True)
-    power_df["delivery_type"] = np.where(
-        power_df["has_snapshot"] == 1, "SNAPSHOT", "DELTA"
-    )
-    power_df = power_df.dropna(subset=["power_mw"]).reset_index(drop=True)
-    if power_df.empty:
-        return empty
+    power_df = power_df.sort_values("time").reset_index(drop=True)
 
-    # ── Upstream-throttle detection (up front) ───────────────────────
-    # When delivery rate collapses (e.g. Apr 16 19:00 UTC on Tesla:
-    # 7k -> 200 rows/hour for 10+ hours), most points stop getting
-    # status updates and the aggregate freezes at a fake plateau. The
-    # drift correction then over-subtracts against that plateau,
-    # producing downstream V-dips. Flag buckets where DELTA count is
-    # < 20% of the median and which are part of a run >= 4 buckets
-    # (20+ min), exclude SNAPSHOT buckets (ground truth), and mark
-    # flagged buckets as NaN **before** drift correction so the
-    # correction uses only reliable anchors.
+    # ── Upper edge: DELTA-derived estimate (raw, overestimates) ──────
+    # In the rare bucket with SNAPSHOT but no DELTA, fall back to snap_mw.
+    upper = power_df["delta_mw"].where(
+        power_df["delta_mw"].notna(), power_df["snap_mw"]
+    ).astype(float)
+
+    # ── Upstream-throttle detection ──────────────────────────────────
+    # Buckets where DELTA count is <20% of median, in runs of >=4
+    # consecutive buckets (>=20 min), are marked NaN on both edges.
+    # Prevents the band from collapsing / spiking during feed stalls.
     throttle_flag = np.zeros(len(power_df), dtype=bool)
-    try:
-        if len(power_df) >= 12:
-            counts = power_df["n_deltas"].values
-            baseline = float(np.median(counts))
-            if baseline >= 10:
-                low = counts < 0.2 * baseline
-                i = 0
-                while i < len(low):
-                    if low[i]:
-                        j = i
-                        while j < len(low) and low[j]:
-                            j += 1
-                        if j - i >= 4:
-                            throttle_flag[i:j] = True
-                        i = j
-                    else:
-                        i += 1
-                # SNAPSHOT rows are ground truth -- never flag them.
-                throttle_flag[(power_df["has_snapshot"] == 1).values] = False
-    except Exception:
-        throttle_flag[:] = False
+    if len(power_df) >= 12:
+        counts = power_df["n_deltas"].values
+        baseline = float(np.median(counts))
+        if baseline >= 10:
+            low = counts < 0.2 * baseline
+            i = 0
+            while i < len(low):
+                if low[i]:
+                    j = i
+                    while j < len(low) and low[j]:
+                        j += 1
+                    if j - i >= 4:
+                        throttle_flag[i:j] = True
+                    i = j
+                else:
+                    i += 1
+    upper = upper.mask(throttle_flag)
 
-    power_vals = power_df["power_mw"].values.copy().astype(float)
-    power_vals[throttle_flag] = np.nan
-    times_i64 = power_df["time"].values.astype("int64")
+    # ── k(t): SNAPSHOT / DELTA ratio, piecewise-linear across time ───
+    # For each SNAPSHOT bucket, k_i = snap_mw_i / mean(DELTA estimate in
+    # ±1h window). Clipped to [0.05, 1.5] so obviously-broken snapshots
+    # can't drag the floor to zero or above the upper. Interpolated
+    # linearly between anchors; constant extrapolation at the endpoints.
+    snap_mask = (power_df["n_snaps"] > 0) & power_df["snap_mw"].notna()
+    snap_indices = np.where(snap_mask.values)[0]
 
-    # ── Proportional drift correction (NaN-aware) ──────────────────
-    snap_mask = power_df["delivery_type"] == "SNAPSHOT"
-    snap_indices = power_df.index[snap_mask].tolist()
-
-    drift_rates_per_ns: list[float] = []
-    for i in range(len(snap_indices) - 1):
-        idx_a = snap_indices[i]
-        idx_b = snap_indices[i + 1]
-        if idx_b <= idx_a + 1:
+    k_at_snap = np.full(len(power_df), np.nan)
+    window = 12  # 12 buckets of 5 min = 1 h half-window
+    for i in snap_indices:
+        lo = max(0, i - window)
+        hi = min(len(power_df), i + window + 1)
+        window_vals = upper.iloc[lo:hi].dropna()
+        if len(window_vals) == 0:
             continue
-        # Walk backward past any throttled (NaN) buckets to find the
-        # last reliable reading before the right SNAPSHOT anchor.
-        j = idx_b - 1
-        while j > idx_a and np.isnan(power_vals[j]):
-            j -= 1
-        if j <= idx_a:
+        delta_est = float(window_vals.mean())
+        snap_val = float(power_df["snap_mw"].iat[i])
+        if delta_est <= 0 or snap_val <= 0:
             continue
-        power_before_b = power_vals[j]
-        power_at_b = power_vals[idx_b]
-        if np.isnan(power_at_b):
-            continue
-        jump = power_before_b - power_at_b
-        t_a = times_i64[idx_a]
-        t_b = times_i64[idx_b]
-        span = t_b - t_a
-        if span <= 0:
-            continue
-        drift_rates_per_ns.append(jump / span)
-        if abs(jump) < 0.01:
-            continue
-        sl = slice(idx_a + 1, idx_b)
-        frac = (times_i64[sl] - t_a) / span
-        # NaN - finite stays NaN; reliable values get drift-corrected.
-        power_vals[sl] = power_vals[sl] - jump * frac
+        k_at_snap[i] = float(np.clip(snap_val / delta_est, 0.05, 1.5))
 
-    # ── Extrapolate correction past the last SNAPSHOT ──────────────
-    if snap_indices and drift_rates_per_ns:
-        last_snap_idx = snap_indices[-1]
-        if last_snap_idx + 1 < len(power_vals):
-            drift_rate = float(np.median(drift_rates_per_ns))
-            t_last = times_i64[last_snap_idx]
-            sl_tail = slice(last_snap_idx + 1, len(power_vals))
-            dt = times_i64[sl_tail] - t_last
-            power_vals[sl_tail] = power_vals[sl_tail] - drift_rate * dt
+    k_series = pd.Series(k_at_snap, index=power_df.index)
+    if k_series.notna().any():
+        k_series = k_series.interpolate(method="linear", limit_direction="both")
+    else:
+        # No usable SNAPSHOTs in window -- band collapses to single line.
+        k_series = pd.Series(1.0, index=power_df.index)
 
-    power_df["power_mw"] = power_vals
+    lower = upper * k_series
 
-    snap_df = power_df.loc[snap_mask, ["time"]].copy()
-    timeline = power_df[["time", "power_mw"]].set_index("time").sort_index()
-    throttle_times = power_df.loc[throttle_flag, "time"].values
+    # ── Short-segment filter ─────────────────────────────────────────
+    # Drop contiguous non-NaN runs shorter than 24 buckets (2 h). These
+    # tiny islands (usually partial feed recovery) clutter the plot and
+    # are never long enough to trust.
+    def _drop_short_runs(s: pd.Series, min_len: int = 24) -> pd.Series:
+        out = s.copy()
+        valid = out.notna().values
+        i = 0
+        while i < len(valid):
+            if valid[i]:
+                j = i
+                while j < len(valid) and valid[j]:
+                    j += 1
+                if j - i < min_len:
+                    out.iloc[i:j] = np.nan
+                i = j
+            else:
+                i += 1
+        return out
 
-    # ── Visual smoothing (60-min centred rolling mean) ───────────────
-    # Applied on top of drift correction to present a clean curve free
-    # of residual 5-min jitter. NaN buckets (throttled zones, stalled
-    # feeds) are re-applied after smoothing so the trace breaks there
-    # rather than being filled with a straight-line interpolation.
-    # Visualisation aid only; the underlying DB rows are untouched.
-    if len(timeline) >= 12:
-        smoothed = (
-            timeline["power_mw"]
-            .rolling(12, min_periods=6, center=True)
-            .mean()
-        )
-        if len(throttle_times):
-            smoothed.loc[timeline.index.isin(throttle_times)] = np.nan
-        timeline["power_mw"] = smoothed
+    upper = _drop_short_runs(upper)
+    lower = _drop_short_runs(lower)
 
-    # ── Physical lower bound ─────────────────────────────────────────
-    # Estimated power is SUM(nameplate_rated_power) over points in use,
-    # so it is mathematically non-negative. The proportional drift
-    # correction can over-subtract when true power is non-monotonic
-    # between two SNAPSHOTs; clip to zero.
-    timeline["power_mw"] = timeline["power_mw"].clip(lower=0)
+    # ── 60-min centred rolling mean (visualisation only) ─────────────
+    if len(upper) >= 12:
+        upper_s = upper.rolling(12, min_periods=6, center=True).mean()
+        lower_s = lower.rolling(12, min_periods=6, center=True).mean()
+        # Re-impose gaps so throttle/short-segment zones stay broken.
+        mask = upper.isna() | lower.isna()
+        upper_s[mask.values] = np.nan
+        lower_s[mask.values] = np.nan
+        upper = upper_s
+        lower = lower_s
 
-    # ── Trim to the 8-day display window ─────────────────────────────
-    # The extra pre-cutoff anchor row was pulled in only to give the
-    # earliest visible point a left-side drift-correction anchor.
+    # Physical lower bound: P = SUM(nameplate_rated_kW over in-use) >= 0.
+    upper = upper.clip(lower=0)
+    lower = lower.clip(lower=0)
+    # Numerical guard: lower should never exceed upper.
+    lower = pd.concat([lower, upper], axis=1).min(axis=1)
+
+    midpoint = (upper + lower) / 2.0
+
+    timeline = pd.DataFrame({
+        "power_mw_upper": upper.values,
+        "power_mw_lower": lower.values,
+        "power_mw": midpoint.values,
+    }, index=power_df["time"])
+    timeline.index.name = "time"
+    timeline = timeline.sort_index()
+
+    # Trim to 8-day display window (pre-cutoff anchor row was only for k).
     if getattr(timeline.index, "tz", None) is None:
         cutoff_ts = pd.Timestamp(cutoff_dt.replace(tzinfo=None))
     else:
         cutoff_ts = pd.Timestamp(cutoff_dt)
     timeline = timeline[timeline.index >= cutoff_ts]
+
+    snap_df = power_df.loc[snap_mask, ["time"]].copy()
     if not snap_df.empty:
         snap_t = snap_df["time"]
         snap_tz = getattr(snap_t.dt, "tz", None)
@@ -349,7 +361,6 @@ def load_power_and_snapshots(slug: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         )
         snap_df = snap_df[snap_t >= snap_cutoff]
 
-    # Return the last SNAPSHOT time for uncorrected-region shading
     return timeline, snap_df
 
 
@@ -570,16 +581,16 @@ with st.sidebar:
     st.caption(
         "**Methodology** -- Each provider delivers a full-state "
         "**SNAPSHOT** roughly once per day, with incremental **DELTA** "
-        "updates in between. Because some status transitions are lost "
-        "between pushes (the Mobilithek packet buffer overwrites unread "
-        "deliveries), the DELTA-only state drifts, typically "
-        "overestimating active chargers. A **proportional drift "
-        "correction** is applied, linearly distributing the error "
-        "between consecutive SNAPSHOT anchors. Periods where the "
-        "Mobilithek delivery rate collapses (upstream throttling) are "
-        "shown as **gaps** rather than interpolated across. A "
-        "**60-minute centred rolling mean** is then applied purely "
-        "for visualisation (DB rows are not altered)."
+        "updates in between. The DELTA protocol is lossy (the Mobilithek "
+        "packet buffer overwrites unread deliveries), so the DELTA-only "
+        "state drifts upward over the day. Each line is drawn as a "
+        "**range band**: the upper edge is the raw DELTA-derived "
+        "estimate (overstates active chargers), the lower edge scales "
+        "the DELTA shape by the SNAPSHOT/DELTA ratio observed at the "
+        "nearest ground-truth anchor. **True load sits inside the "
+        "band**; the band's width is the uncertainty. Upstream-throttle "
+        "periods are shown as gaps. A 60-minute centred rolling mean is "
+        "applied for visualisation only (DB rows are untouched)."
     )
     st.caption(
         "**Power estimation** -- "
@@ -620,22 +631,42 @@ for slug in selected_providers:
 if power_traces:
     fig = go.Figure()
 
-    # ── Per-provider traces (single solid line each) ─────────────────
+    # ── Per-provider range band (upper=raw DELTA, lower=SNAPSHOT-scaled)
+    # Truth sits inside the band. Width expresses the DELTA-drift
+    # uncertainty: narrow near a SNAPSHOT anchor, wider further away.
     for slug, ts in power_traces.items():
         cfg = PROVIDERS[slug]
-        # Data already 5-min aggregated + smoothed at the SQL / load
-        # layer. NaN values mark upstream-throttle periods — pass them
-        # through so Plotly breaks the line (connectgaps=False) rather
-        # than drawing straight segments across the gap.
-        if ts["power_mw"].isna().all():
+        if ts["power_mw_upper"].isna().all():
             continue
+        label = cfg["label"]
+        color = cfg["color"]
+        fill_rgba = _hex_to_rgba(color, 0.18)
+
+        # Upper edge: invisible line that the fill anchors against.
         fig.add_trace(go.Scatter(
-            x=ts.index, y=ts["power_mw"],
-            name=cfg["label"],
+            x=ts.index, y=ts["power_mw_upper"],
+            name=f"{label} upper",
             mode="lines",
-            line=dict(width=1.4, color=cfg["color"]),
+            line=dict(width=0, color=color),
+            showlegend=False,
+            hoverinfo="skip",
             connectgaps=False,
-            hovertemplate="%{y:.0f} MW<extra>" + cfg["label"] + "</extra>",
+        ))
+        # Lower edge: visible line, fills up to the previous trace.
+        upper_cd = ts["power_mw_upper"].values.reshape(-1, 1)
+        fig.add_trace(go.Scatter(
+            x=ts.index, y=ts["power_mw_lower"],
+            name=label,
+            mode="lines",
+            line=dict(width=1.4, color=color),
+            fill="tonexty",
+            fillcolor=fill_rgba,
+            connectgaps=False,
+            customdata=upper_cd,
+            hovertemplate=(
+                "%{y:.0f}–%{customdata[0]:.0f} MW"
+                "<extra>" + label + "</extra>"
+            ),
         ))
 
     fig.update_layout(
@@ -654,10 +685,13 @@ if power_traces:
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        "⚠️ **Explanatory note:** on 11 Apr 2025, data collection was switched "
-        "from pull to push delivery. This introduced signal oscillation in "
-        "eco-movement data, currently under investigation. "
-        "See [GitHub](https://github.com/c-metz/ev-pulse) for status."
+        "Each shaded band shows the uncertainty range for that provider. "
+        "The lower edge is anchored to upstream SNAPSHOT ground truth "
+        "(typically 30-50% of the raw DELTA estimate on eco-movement -- "
+        "the DELTA stream has accumulated upward drift since the last "
+        "SNAPSHOT). The upper edge is the uncorrected DELTA-derived "
+        "estimate. See [GitHub](https://github.com/c-metz/ev-pulse) for "
+        "methodology."
     )
 
     # ── Download: timeline data as CSV ────────────────────────────────
@@ -678,10 +712,8 @@ if power_traces:
         )
 
     st.caption(
-        "Dashed lines = **SNAPSHOT** ground truth. "
-        "Between snapshots, a proportional drift correction is applied "
-        "to compensate for missed delta transitions. "
-        "The orange-shaded region after the last SNAPSHOT is raw (uncorrected). "
+        "CSV export contains the midpoint of each provider's uncertainty "
+        "band (1-minute resolution, forward-filled from 5-minute buckets). "
         "Power = SUM(nameplate-rated kW) for all in-use points."
     )
 else:
