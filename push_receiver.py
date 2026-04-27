@@ -54,6 +54,12 @@ SUBSCRIPTION_MAP: dict[str, tuple[str, str]] = {
     # ladenetz
     "970702370149138432": ("ladenetz", "static"),
     "970702352017145856": ("ladenetz", "dynamic"),
+    # smatrics
+    "981895858521624576": ("smatrics", "static"),
+    "970701736117174272": ("smatrics", "dynamic"),
+    # qwello
+    "981894646594252800": ("qwello", "static"),
+    "981894573311537152": ("qwello", "dynamic"),
 }
 
 # ── Providers whose static data must be pulled (no push subscription) ─

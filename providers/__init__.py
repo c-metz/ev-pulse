@@ -22,6 +22,8 @@ from providers.enbw import EnbwProvider
 from providers.eliso import ElisoProvider
 from providers.ladenetz import LadenetzProvider
 from providers.msu import MsuProvider
+from providers.qwello import QwelloProvider
+from providers.smatrics import SmatricsProvider
 from providers.wirelane import WirelaneProvider
 
 PROVIDERS: dict[str, type[Provider]] = {
@@ -31,6 +33,8 @@ PROVIDERS: dict[str, type[Provider]] = {
     "eliso": ElisoProvider,
     "ladenetz": LadenetzProvider,
     "msu": MsuProvider,
+    "qwello": QwelloProvider,
+    "smatrics": SmatricsProvider,
     "wirelane": WirelaneProvider,
 }
 
