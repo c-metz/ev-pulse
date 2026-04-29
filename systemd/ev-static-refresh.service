@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily static-metadata refresh for all EV providers
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+Group=ev
+WorkingDirectory=/home/ev/ev-monitor
+ExecStart=/home/ev/ev-monitor/.venv/bin/python /home/ev/ev-monitor/refresh_static.py
+# Don't let a hung HTTP request keep the unit running forever.
+TimeoutStartSec=10min
+Nice=10
