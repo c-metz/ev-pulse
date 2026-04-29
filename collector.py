@@ -94,7 +94,20 @@ def store_static_snapshot(
     # We never DELETE — old versions remain queryable by fetched_at_utc.
     deduped = deduped.copy()
     deduped["fetched_at_utc"] = datetime.now(timezone.utc).isoformat()
-    deduped.to_sql("charging_points", conn, if_exists="append", index=False)
+    # Use INSERT OR REPLACE on the point_id PRIMARY KEY so re-ingestion
+    # of the same static feed (after restart, periodic refresh, or daily
+    # cron) is idempotent. Plain to_sql(append) would trip the UNIQUE
+    # constraint on every refresh after the first.
+    table_cols = {
+        r[1] for r in conn.execute(
+            "PRAGMA table_info(charging_points)"
+        ).fetchall()
+    }
+    cols = [c for c in deduped.columns if c in table_cols]
+    placeholders = ",".join(["?"] * len(cols))
+    sql = f"INSERT OR REPLACE INTO charging_points ({','.join(cols)}) VALUES ({placeholders})"
+    sanitised = deduped[cols].astype(object).where(pd.notna(deduped[cols]), None)
+    conn.executemany(sql, sanitised.itertuples(index=False, name=None))
     conn.execute(
         "INSERT OR REPLACE INTO static_meta (key, value) VALUES (?, ?)",
         ("last_publication_time", publication_time.isoformat()),
@@ -295,6 +308,18 @@ def store_dynamic_snapshot(
                 )
     else:
         updated = status_df[KEY_COLUMNS + tracked].copy()
+
+    # Some upstream feeds (e.g. eco-movement) include the same point_id
+    # more than once per SNAPSHOT, sometimes with conflicting statuses
+    # ("available" + "charging" for the same UUID). Keep the LAST entry
+    # so downstream INSERTs into uniqueness-constrained tables succeed.
+    if updated["point_id"].duplicated().any():
+        before = len(updated)
+        updated = updated.drop_duplicates(subset=["point_id"], keep="last").reset_index(drop=True)
+        LOGGER.warning(
+            "%s %s: deduped %d duplicate point_ids in delivery (%d -> %d)",
+            provider.name, delivery_type, before - len(updated), before, len(updated),
+        )
 
     # ── Step 2: Counts from the FULL state (not just the delivery) ───
     in_use = int(updated["status"].eq(provider.in_use_status).sum())
