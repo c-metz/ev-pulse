@@ -46,8 +46,12 @@ db_size_gb() {
 # files matching each <prefix>_YYYY-MM-DD.sqlite pattern.
 rotate_class() {
     local pattern="$1" keep="$2"
+    # `|| true` so a non-matching glob doesn't take down the whole script
+    # via `set -euo pipefail` (ls returns 2 when no files match, and
+    # pipefail propagates that through the pipeline).
     # shellcheck disable=SC2012
-    ls -1t "$BACKUP_DIR"/${pattern}_*.sqlite 2>/dev/null | tail -n +$((keep + 1)) | while read -r f; do
+    { ls -1t "$BACKUP_DIR"/${pattern}_*.sqlite 2>/dev/null || true; } \
+        | tail -n +$((keep + 1)) | while read -r f; do
         echo "[$DATE] ROTATE remove $(basename "$f")"
         rm -f "$f"
     done
