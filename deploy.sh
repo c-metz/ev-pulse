@@ -79,10 +79,14 @@ if changed_dir systemd/; then
         set +e
         sudo install -m 644 -t /etc/systemd/system/ "$REPO_DIR"/systemd/*.service "$REPO_DIR"/systemd/*.timer 2>> "$LOG"
         sudo systemctl daemon-reload >> "$LOG" 2>&1
-        # Restart timers so any schedule change takes effect now.
+        # Enable + restart timers. enable is idempotent and is what
+        # bootstraps a brand-new timer on first deploy. restart applies
+        # any schedule change to an already-running timer.
         for unit in "$REPO_DIR"/systemd/*.timer; do
             [ -f "$unit" ] || continue
-            sudo systemctl restart "$(basename "$unit")" >> "$LOG" 2>&1
+            unit_name="$(basename "$unit")"
+            sudo systemctl enable "$unit_name" >> "$LOG" 2>&1
+            sudo systemctl restart "$unit_name" >> "$LOG" 2>&1
         done
         set -e
         echo "Synced systemd units" >> "$LOG"

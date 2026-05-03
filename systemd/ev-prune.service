@@ -1,0 +1,18 @@
+[Unit]
+Description=Daily retention pruning for EV provider dynamic DBs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ev
+Group=ev
+WorkingDirectory=/home/ev/ev-monitor
+ExecStart=/home/ev/ev-monitor/.venv/bin/python /home/ev/ev-monitor/prune_dynamic.py
+# A normal incremental prune (~one day's rows) finishes in seconds. The
+# generous timeout is for the one-shot initial cleanup of the legacy
+# backlog, which can take 30+ minutes on eco_dynamic.
+TimeoutStartSec=2h
+# Pruning is housekeeping; let collectors win CPU contention.
+Nice=15
+IOSchedulingClass=idle

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run ev-prune.service once a day
+Documentation=file:///home/ev/ev-monitor/prune_dynamic.py
+
+[Timer]
+# 04:00 UTC -- after backup.sh (03:00 UTC) has captured today's snapshot,
+# so we never delete history that hasn't yet been backed up.
+OnCalendar=*-*-* 04:00:00 UTC
+# Run on boot if we missed the schedule (e.g. server was down at 04:00).
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
