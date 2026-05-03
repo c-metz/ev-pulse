@@ -61,16 +61,25 @@ DYNAMIC_PROVIDERS = [
 ]
 
 
-def prune_one(name: str, days: int, dry_run: bool) -> bool:
-    """Prune one provider's dynamic DB; return True on success."""
+def prune_one(name: str, days: int, dry_run: bool, before: str | None = None) -> bool:
+    """Prune one provider's dynamic DB; return True on success.
+
+    ``before`` overrides ``days`` when provided. Use it for surgical
+    one-shot cleanups (e.g., removing a specific bad-data window) where
+    a relative window from "now" would be either too coarse or would
+    keep shifting on subsequent runs.
+    """
     try:
         provider = get_provider(name)
     except ValueError as exc:
         LOGGER.error("%s", exc)
         return False
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    cutoff_iso = cutoff.isoformat(timespec="seconds")
+    if before is not None:
+        cutoff_iso = before
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff.isoformat(timespec="seconds")
 
     db_path = provider.dynamic_db_path
     if not db_path.exists():
@@ -176,15 +185,27 @@ def main(argv: list[str]) -> int:
         "--dry-run", action="store_true",
         help="Count rows without deleting.",
     )
+    parser.add_argument(
+        "--before", type=str, default=None,
+        help=(
+            "Explicit ISO timestamp cutoff (e.g. 2026-04-30T00:00:00+00:00). "
+            "Overrides --days. Use for one-shot surgical cleanups."
+        ),
+    )
     args = parser.parse_args(argv[1:])
 
     targets = args.providers or DYNAMIC_PROVIDERS
     LOGGER.info(
-        "Targets: %s; days=%d; dry_run=%s",
-        ", ".join(targets), args.days, args.dry_run,
+        "Targets: %s; %s; dry_run=%s",
+        ", ".join(targets),
+        f"before={args.before}" if args.before else f"days={args.days}",
+        args.dry_run,
     )
 
-    successes = sum(1 for n in targets if prune_one(n, args.days, args.dry_run))
+    successes = sum(
+        1 for n in targets
+        if prune_one(n, args.days, args.dry_run, before=args.before)
+    )
     LOGGER.info("Done: %d/%d providers pruned", successes, len(targets))
     return 0 if successes > 0 else 1
 
