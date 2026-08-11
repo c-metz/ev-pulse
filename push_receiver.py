@@ -79,7 +79,15 @@ _static_pull_stop = threading.Event()
 
 def _open_db(path) -> sqlite3.Connection:
     """Open a SQLite connection safe for use across threads."""
-    return sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    # SQLite's default busy timeout is 0, so any concurrent writer made a
+    # push fail instantly with "database is locked" -> HTTP 500, and the
+    # upstream dropped that delivery. The nightly prune holds the writer
+    # lock in batches, so without this we lose deliveries every night.
+    conn.execute("PRAGMA busy_timeout=30000")
+    # Per-connection, so it must be set here too, not just in collector.
+    conn.execute("PRAGMA journal_size_limit=67108864")
+    return conn
 
 
 def _init_provider(name: str) -> None:
