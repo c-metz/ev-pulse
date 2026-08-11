@@ -49,6 +49,11 @@ def ensure_static_db(provider: Provider) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Truncate the WAL back to <=64 MB at every checkpoint instead of
+    # leaving it at its high-water mark. Without this a single stalled
+    # checkpoint leaves the file permanently large; one WAL previously
+    # reached 52 GB and filled the whole data volume.
+    conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS static_meta (
             key TEXT PRIMARY KEY,
@@ -133,6 +138,11 @@ def ensure_dynamic_db(provider: Provider) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Truncate the WAL back to <=64 MB at every checkpoint instead of
+    # leaving it at its high-water mark. Without this a single stalled
+    # checkpoint leaves the file permanently large; one WAL previously
+    # reached 52 GB and filled the whole data volume.
+    conn.execute("PRAGMA journal_size_limit=67108864")
 
     in_use_col = provider.in_use_count_column
     tracked_cols_ddl = ",\n            ".join(

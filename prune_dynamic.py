@@ -18,7 +18,7 @@ captured the day's snapshot.
 
 Usage::
 
-    python prune_dynamic.py                       # all dynamic providers, 30 days
+    python prune_dynamic.py                       # all dynamic providers, 7 days
     python prune_dynamic.py --days 14             # custom retention
     python prune_dynamic.py eco_movement          # one provider
     python prune_dynamic.py --dry-run             # count only, don't delete
@@ -38,7 +38,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 LOGGER = logging.getLogger("prune_dynamic")
 
-DEFAULT_DAYS = 30
+DEFAULT_DAYS = 7
 BATCH_SIZE = 50_000
 # Tiny breather between batches so the collector / push receiver gets
 # turns at the writer lock. 0.0 if you want maximum throughput.

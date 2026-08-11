@@ -9,6 +9,7 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -80,21 +81,41 @@ def _human_age(ts: datetime) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 #  DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════
+# The dashboard is a *reader only*. Two rules make that safe:
+#
+#   1. ``mode=ro`` -- a read-write handle would let Streamlit create or
+#      extend a provider's WAL. When the data volume is full that turns
+#      a page render into "disk I/O error"; when it isn't, it still lets
+#      a viewer's query write to a DB only the collector should own.
+#   2. ``contextlib.closing`` -- ``with sqlite3.connect(...)`` commits the
+#      *transaction* but never closes the *connection*. In a long-lived
+#      Streamlit process those handles leak, and every open reader pins a
+#      WAL read-mark so the collector's checkpoints can never reclaim
+#      frames. That is what previously grew one WAL to 52 GB and filled
+#      the volume. Closing deterministically is what prevents a repeat.
+def _connect_ro(db: Path) -> sqlite3.Connection:
+    """Open ``db`` read-only. Caller must close (use ``closing``)."""
+    return sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+
+
 @st.cache_data(ttl=60)
 def load_current_state(slug: str) -> pd.DataFrame:
     db = DATA_DIR / f"{slug}_dynamic.sqlite"
     if not db.exists():
         return pd.DataFrame()
-    with sqlite3.connect(db) as conn:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "current_point_state" in tables:
-            return pd.read_sql_query(
-                "SELECT point_id, status, updated_at AS collected_at_utc"
-                " FROM current_point_state",
-                conn,
-            )
+    try:
+        with contextlib.closing(_connect_ro(db)) as conn:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "current_point_state" in tables:
+                return pd.read_sql_query(
+                    "SELECT point_id, status, updated_at AS collected_at_utc"
+                    " FROM current_point_state",
+                    conn,
+                )
+            return pd.DataFrame()
+    except (sqlite3.Error, pd.errors.DatabaseError):
         return pd.DataFrame()
 
 
@@ -114,29 +135,34 @@ def load_latest_snapshot(slug: str) -> dict:
     }
     if not db.exists():
         return out
-    with sqlite3.connect(db) as conn:
-        cols = {r[1] for r in conn.execute(
-            "PRAGMA table_info(snapshot_runs)"
-        ).fetchall()}
-        # Pick the in-use column that exists for this provider.
-        in_use_col = next(
-            (c for c in ("charging_count", "occupied_count") if c in cols),
-            None,
-        )
-        select_in_use = in_use_col if in_use_col else "NULL"
-        row = conn.execute(
-            f"SELECT collected_at_utc, delivery_type, {select_in_use},"
-            f" estimated_power_mw FROM snapshot_runs"
-            f" ORDER BY snapshot_id DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            out["collected_at"] = datetime.fromisoformat(row[0])
-            out["delivery_type"] = row[1]
-            out["in_use_count"] = row[2]
-            out["estimated_power_mw"] = row[3]
-        out["total_runs"] = conn.execute(
-            "SELECT COUNT(*) FROM snapshot_runs"
-        ).fetchone()[0]
+    try:
+        with contextlib.closing(_connect_ro(db)) as conn:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(snapshot_runs)"
+            ).fetchall()}
+            if not cols:  # table absent (freshly recreated DB)
+                return out
+            # Pick the in-use column that exists for this provider.
+            in_use_col = next(
+                (c for c in ("charging_count", "occupied_count") if c in cols),
+                None,
+            )
+            select_in_use = in_use_col if in_use_col else "NULL"
+            row = conn.execute(
+                f"SELECT collected_at_utc, delivery_type, {select_in_use},"
+                f" estimated_power_mw FROM snapshot_runs"
+                f" ORDER BY snapshot_id DESC LIMIT 1"
+            ).fetchone()
+            if row and row[0]:
+                out["collected_at"] = datetime.fromisoformat(row[0])
+                out["delivery_type"] = row[1]
+                out["in_use_count"] = row[2]
+                out["estimated_power_mw"] = row[3]
+            out["total_runs"] = conn.execute(
+                "SELECT COUNT(*) FROM snapshot_runs"
+            ).fetchone()[0]
+    except (sqlite3.Error, pd.errors.DatabaseError, ValueError):
+        return out
     return out
 
 
@@ -161,45 +187,48 @@ def load_power_band(slug: str) -> pd.DataFrame:
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    with sqlite3.connect(db) as conn:
-        cols = {r[1] for r in conn.execute(
-            "PRAGMA table_info(snapshot_runs)"
-        ).fetchall()}
-        if "estimated_power_mw" not in cols:
-            return empty
+    try:
+        with contextlib.closing(_connect_ro(db)) as conn:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(snapshot_runs)"
+            ).fetchall()}
+            if "estimated_power_mw" not in cols:
+                return empty
 
-        anchor_row = conn.execute(
-            """SELECT MAX(collected_at_utc) FROM snapshot_runs
-               WHERE delivery_type='SNAPSHOT'
-                 AND collected_at_utc < ?
-                 AND collected_at_utc >= datetime(?, '-2 days')""",
-            (cutoff_str, cutoff_str),
-        ).fetchone()
-        anchor_time = anchor_row[0] if anchor_row else None
-        query_from = anchor_time if anchor_time else cutoff_str
+            anchor_row = conn.execute(
+                """SELECT MAX(collected_at_utc) FROM snapshot_runs
+                   WHERE delivery_type='SNAPSHOT'
+                     AND collected_at_utc < ?
+                     AND collected_at_utc >= datetime(?, '-2 days')""",
+                (cutoff_str, cutoff_str),
+            ).fetchone()
+            anchor_time = anchor_row[0] if anchor_row else None
+            query_from = anchor_time if anchor_time else cutoff_str
 
-        df = pd.read_sql_query(
-            """
-            SELECT
-                datetime(
-                    (CAST(strftime('%s', collected_at_utc) AS INTEGER) / 300) * 300,
-                    'unixepoch'
-                ) AS time,
-                AVG(CASE WHEN delivery_type='DELTA'
-                         THEN estimated_power_mw END) AS delta_mw,
-                AVG(CASE WHEN delivery_type='SNAPSHOT'
-                         THEN estimated_power_mw END) AS snap_mw,
-                COUNT(CASE WHEN delivery_type='DELTA'    THEN 1 END) AS n_deltas,
-                COUNT(CASE WHEN delivery_type='SNAPSHOT' THEN 1 END) AS n_snaps
-            FROM snapshot_runs
-            WHERE collected_at_utc >= ?
-              AND estimated_power_mw IS NOT NULL
-            GROUP BY time
-            ORDER BY time
-            """,
-            conn,
-            params=(query_from,),
-        )
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    datetime(
+                        (CAST(strftime('%s', collected_at_utc) AS INTEGER) / 300) * 300,
+                        'unixepoch'
+                    ) AS time,
+                    AVG(CASE WHEN delivery_type='DELTA'
+                             THEN estimated_power_mw END) AS delta_mw,
+                    AVG(CASE WHEN delivery_type='SNAPSHOT'
+                             THEN estimated_power_mw END) AS snap_mw,
+                    COUNT(CASE WHEN delivery_type='DELTA'    THEN 1 END) AS n_deltas,
+                    COUNT(CASE WHEN delivery_type='SNAPSHOT' THEN 1 END) AS n_snaps
+                FROM snapshot_runs
+                WHERE collected_at_utc >= ?
+                  AND estimated_power_mw IS NOT NULL
+                GROUP BY time
+                ORDER BY time
+                """,
+                conn,
+                params=(query_from,),
+            )
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return empty
 
     if df.empty:
         return empty
